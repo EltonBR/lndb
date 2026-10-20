@@ -1,7 +1,9 @@
 #define _GNU_SOURCE
 #define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#include "transfer.h"
 #include "lndb_protocol.h"
+#include "../common/file_wire.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -25,6 +27,47 @@ static int bad_path(const char *p)
     return 0;
 }
 
+/* Reject a symlink in every existing component. Missing suffixes are allowed
+   for destinations that will be created. This is defense in depth; the path
+   is not a chroot and concurrent rename attacks remain possible. */
+static int has_symlink_component(const char *path)
+{
+    if (!path || !*path) return 1;
+    char *copy = strdup(path);
+    if (!copy) return 1;
+    size_t len = strlen(copy);
+    while (len > 1 && copy[len - 1] == '/') copy[--len] = '\0';
+    for (char *s = copy + (*copy == '/'); ; ) {
+        char *slash = strchr(s, '/');
+        if (slash) *slash = '\0';
+        if (*copy) {
+            struct stat st;
+            if (lstat(copy, &st) == 0) {
+                if (S_ISLNK(st.st_mode)) { free(copy); return 1; }
+            } else if (errno != ENOENT) { free(copy); return 1; }
+        }
+        if (!slash) break;
+        *slash = '/';
+        s = slash + 1;
+    }
+    free(copy);
+    return 0;
+}
+
+static int has_parent_component(const char *path)
+{
+    const char *s = path;
+    while (*s) {
+        while (*s == '/') s++;
+        const char *e = strchr(s, '/');
+        size_t n = e ? (size_t)(e - s) : strlen(s);
+        if (n == 2 && s[0] == '.' && s[1] == '.') return 1;
+        if (!e) break;
+        s = e + 1;
+    }
+    return 0;
+}
+
 static int mkdir_parents(const char *path)
 {
     char *p = strdup(path); if (!p) return -1;
@@ -36,33 +79,36 @@ static int mkdir_parents(const char *path)
 
 static int send_meta(int fd, uint8_t kind, uint32_t mode, uint64_t size, const char *path)
 {
-    size_t n = strlen(path); if (n > 60000) return -1;
-    uint8_t *p = malloc(15 + n); if (!p) return -1;
-    p[0] = kind; lndb_put_u32(p + 1, mode);
-    for (int i = 0; i < 8; i++) p[5 + i] = (uint8_t)(size >> (56 - 8 * i));
-    p[13] = (uint8_t)(n >> 8); p[14] = (uint8_t)n; memcpy(p + 15, path, n);
-    int r = lndb_send_frame(fd, LNDB_MSG_FILE_META, p, (uint32_t)(15 + n)); free(p); return r;
+    uint8_t *p = NULL; uint32_t n = 0;
+    if (lndb_file_meta_encode(kind, mode, size, path, &p, &n) < 0) return -1;
+    int r = lndb_send_frame(fd, LNDB_MSG_FILE_META, p, n);
+    free(p);
+    return r;
 }
 
 static int send_tree(int fd, const char *path, const char *rel)
 {
     struct stat st;
-    if (lstat(path, &st) < 0 || S_ISLNK(st.st_mode)) return -1;
+    if (has_symlink_component(path) || lstat(path, &st) < 0 || S_ISLNK(st.st_mode)) return -1;
     if (S_ISDIR(st.st_mode)) {
         if (send_meta(fd, 2, st.st_mode & 0777, 0, rel) < 0) return -1;
-        DIR *d = opendir(path); if (!d) return -1;
+        int dfd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        DIR *d = dfd >= 0 ? fdopendir(dfd) : NULL;
+        if (!d) { if (dfd >= 0) close(dfd); return -1; }
         struct dirent *e; int rc = 0;
         while ((e = readdir(d)) != NULL) {
             if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-            char *child, *childrel;
+            char *child = NULL, *childrel = NULL;
             if (asprintf(&child, "%s/%s", path, e->d_name) < 0 ||
-                asprintf(&childrel, "%s%s%s", rel, *rel ? "/" : "", e->d_name) < 0) { rc = -1; break; }
+                asprintf(&childrel, "%s%s%s", rel, *rel ? "/" : "", e->d_name) < 0) {
+                free(child); free(childrel); rc = -1; break;
+            }
             rc = send_tree(fd, child, childrel); free(child); free(childrel); if (rc < 0) break;
         }
         closedir(d); return rc;
     }
     if (!S_ISREG(st.st_mode) || send_meta(fd, 1, st.st_mode & 0777, (uint64_t)st.st_size, rel) < 0) return -1;
-    int f = open(path, O_RDONLY); if (f < 0) return -1;
+    int f = open(path, O_RDONLY | O_NOFOLLOW); if (f < 0) return -1;
     uint8_t b[32768]; ssize_t n; int rc = 0;
     while ((n = read(f, b, sizeof(b))) > 0) if (lndb_send_frame(fd, LNDB_MSG_FILE_DATA, b, (uint32_t)n) < 0) { rc = -1; break; }
     if (n < 0) rc = -1;
@@ -78,14 +124,11 @@ static int receive_tree(int fd, const char *dest)
     char *root = NULL; int root_kind = 0;
     for (;;) {
         if (lndb_recv_frame(fd, &type, &p, &n) < 0) { rc = -1; break; }
-        if (type != LNDB_MSG_FILE_META || n < 15) { free(p); rc = -1; break; }
-        uint8_t kind = p[0]; uint32_t mode = lndb_get_u32(p + 1);
-        uint64_t size = 0; for (int i = 0; i < 8; i++) size = (size << 8) | p[5 + i];
-        size_t pn = ((size_t)p[13] << 8) | p[14];
-        if (pn != n - 15) { free(p); rc = -1; break; }
+        if (type != LNDB_MSG_FILE_META) { free(p); rc = -1; break; }
+        uint8_t kind; uint32_t mode; uint64_t size; const uint8_t *wire_path; size_t pn;
+        if (lndb_file_meta_decode(p, n, &kind, &mode, &size, &wire_path, &pn) < 0) { free(p); rc = -1; break; }
         char *rel = malloc(pn + 1); if (!rel) { free(p); rc = -1; break; }
-        memcpy(rel, p + 15, pn); rel[pn] = 0; free(p); p = NULL;
-        if (memchr(rel, 0, pn)) { free(rel); rc = -1; break; }
+        memcpy(rel, wire_path, pn); rel[pn] = 0; free(p); p = NULL;
         if (kind == 0) { free(rel); break; }
         if (bad_path(rel) || size > (uint64_t)INT64_MAX) { free(rel); rc = -1; break; }
         if (!root) {
@@ -95,6 +138,7 @@ static int receive_tree(int fd, const char *dest)
             else root = strdup(dest);
             root_kind = kind;
             if (!root) { free(rel); rc = -1; break; }
+            if (has_symlink_component(root)) { free(rel); rc = -1; break; }
             if (root_kind == 2 && mkdir_parents(root) < 0) { free(rel); rc = -1; break; }
         }
         const char *tail = rel;
@@ -104,6 +148,7 @@ static int receive_tree(int fd, const char *dest)
         if (!tail || !*tail) target = strdup(root);
         else if (asprintf(&target, "%s/%s", root, tail) < 0) target = NULL;
         if (!target) { free(rel); rc = -1; break; }
+        if (has_symlink_component(target)) { free(target); free(rel); rc = -1; break; }
         if (kind == 2) {
             if (mkdir_parents(target) < 0 || (mkdir(target, mode & 0777) < 0 && errno != EEXIST)) rc = -1;
             else if (chmod(target, mode & 0777) < 0) rc = -1;
@@ -111,7 +156,7 @@ static int receive_tree(int fd, const char *dest)
             if (mkdir_parents(target) < 0) rc = -1;
             char *tmp = NULL; int out = -1;
             if (!rc && asprintf(&tmp, "%s.lndb-tmp-%ld", target, (long)getpid()) >= 0)
-                out = open(tmp, O_WRONLY | O_CREAT | O_EXCL, mode & 0777);
+                out = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode & 0777);
             if (out < 0) rc = -1;
             uint64_t got = 0;
             while (!rc) {
@@ -144,7 +189,9 @@ int lndbd_transfer(int fd, const uint8_t *req, uint32_t len)
     char *path = malloc(len); if (!path) return -1;
     memcpy(path, req + 1, len - 1); path[len - 1] = 0;
     int rc;
-    if (req[0] == 1) rc = receive_tree(fd, path);
+    if (has_parent_component(path)) rc = lndb_send_frame(fd, LNDB_MSG_ERROR, "parent path component rejected", (uint32_t)(sizeof("parent path component rejected") - 1));
+    else if (has_symlink_component(path)) rc = lndb_send_frame(fd, LNDB_MSG_ERROR, "symlink path rejected", (uint32_t)(sizeof("symlink path rejected") - 1));
+    else if (req[0] == 1) rc = receive_tree(fd, path);
     else if (req[0] == 2) {
         size_t path_len = strlen(path);
         while (path_len > 1 && path[path_len - 1] == '/') path[--path_len] = '\0';

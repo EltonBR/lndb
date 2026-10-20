@@ -3,6 +3,7 @@
 #include "lndb_config.h"
 #include "lndb_protocol.h"
 #include "../client/transfer.h"
+#include "../common/file_wire.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -47,6 +48,75 @@ static int run_transfer(int push, const char *src, const char *dst)
     return 0;
 }
 
+static void server_reject_upload(int fd)
+{
+    uint8_t type, *p = NULL; uint32_t len = 0;
+    if (lndb_recv_frame(fd, &type, &p, &len) < 0 || type != LNDB_MSG_FILE_REQUEST) _exit(2);
+    free(p); p = NULL;
+    for (;;) {
+        if (lndb_recv_frame(fd, &type, &p, &len) < 0) _exit(3);
+        if (type == LNDB_MSG_FILE_META && len >= 15 && p[0] == 0) {
+            free(p); uint8_t status[4]; lndb_put_u32(status, 7);
+            _exit(lndb_send_frame(fd, LNDB_MSG_FILE_DONE, status, sizeof(status)) == 0 ? 0 : 4);
+        }
+        free(p); p = NULL;
+    }
+}
+
+static int run_remote_failure(const char *src, const char *dst)
+{
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    pid_t pid = fork(); CHECK(pid >= 0);
+    if (pid == 0) { close(sv[0]); server_reject_upload(sv[1]); }
+    close(sv[1]);
+    int rc = lndb_client_transfer(sv[0], 1, src, dst);
+    close(sv[0]); int status;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(rc < 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    return 0;
+}
+
+static void server_interrupt_download(int fd)
+{
+    uint8_t type, *p = NULL; uint32_t len = 0;
+    if (lndb_recv_frame(fd, &type, &p, &len) < 0 || type != LNDB_MSG_FILE_REQUEST) _exit(2);
+    free(p);
+    uint8_t *meta = NULL; uint32_t ml = 0;
+    if (lndb_file_meta_encode(1, 0600, 10, "source/file", &meta, &ml) < 0) _exit(3);
+    if (lndb_send_frame(fd, LNDB_MSG_FILE_META, meta, ml) < 0) _exit(4);
+    free(meta);
+    if (lndb_send_frame(fd, LNDB_MSG_FILE_DATA, "abc", 3) < 0) _exit(5);
+    close(fd); _exit(0);
+}
+
+static int run_interrupted_download(const char *dest, const char *expected)
+{
+    int sv[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    pid_t pid = fork(); CHECK(pid >= 0);
+    if (pid == 0) { close(sv[0]); server_interrupt_download(sv[1]); }
+    close(sv[1]);
+    int rc = lndb_client_transfer(sv[0], 0, "source/file", dest);
+    close(sv[0]); int status;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    struct stat st;
+    CHECK(rc < 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0 && lstat(expected, &st) < 0 && errno == ENOENT);
+    return 0;
+}
+
+static int run_symlink_reject(const char *linkpath, const char *dest)
+{
+    int sv[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    pid_t pid = fork(); CHECK(pid >= 0);
+    if (pid == 0) { close(sv[0]); server_transfer(sv[1]); }
+    close(sv[1]);
+    int rc = lndb_client_transfer(sv[0], 0, linkpath, dest);
+    close(sv[0]); int status;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(rc < 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    return 0;
+}
+
 static int write_file(const char *path, const unsigned char *data, size_t len, mode_t mode)
 {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
@@ -88,9 +158,25 @@ int main(void)
     char tmp[] = "/tmp/lndb-local-test-XXXXXX";
     CHECK(mkdtemp(tmp) != NULL);
     char conf[512], badconf[512], clientconf[512], srcdir[512], subdir[512], remote[512], remote2[512], remote3[512];
-    char local[512], local2[512], local3[512], local_existing[512], p[512], q[512], remote_src[512];
+    char local[512], local2[512], local3[512], local_existing[512], interrupted[512], interrupted_file[512], symlink_path[512], p[512], q[512], remote_src[512];
     CHECK(append_path(conf, sizeof(conf), tmp, "/nested/lndbd.conf") == 0);
     struct lndb_server_config sc; char err[128];
+    uint8_t *wire = NULL, wire_kind;
+    uint32_t wire_len = 0, wire_mode;
+    uint64_t wire_size;
+    const uint8_t *wire_path;
+    size_t wire_path_len;
+    CHECK(lndb_file_meta_encode(1, 0644, 3, "file", &wire, &wire_len) == 0);
+    CHECK(lndb_file_meta_decode(wire, wire_len, &wire_kind, &wire_mode,
+                                &wire_size, &wire_path, &wire_path_len) == 0);
+    CHECK(wire_kind == 1 && wire_mode == 0644 && wire_size == 3 &&
+          wire_path_len == 4 && memcmp(wire_path, "file", 4) == 0);
+    wire[0] = 3;
+    CHECK(lndb_file_meta_decode(wire, wire_len, &wire_kind, &wire_mode,
+                                &wire_size, &wire_path, &wire_path_len) < 0);
+    free(wire); wire = NULL;
+    CHECK(lndb_file_meta_encode(3, 0644, 3, "file", &wire, &wire_len) < 0);
+    CHECK(lndb_file_meta_encode(0, 0, 0, "not-empty", &wire, &wire_len) < 0);
     CHECK(lndb_server_config_load(conf, &sc, err, sizeof(err)) == 0);
     struct stat st; CHECK(stat(conf, &st) == 0 && (st.st_mode & 0777) == 0600);
     char first[65]; memcpy(first, sc.api_key, sizeof(first));
@@ -143,12 +229,18 @@ int main(void)
     CHECK(append_path(local2, sizeof(local2), tmp, "/downloaded tree two") == 0);
     CHECK(append_path(local3, sizeof(local3), tmp, "/downloaded tree three") == 0);
     CHECK(append_path(local_existing, sizeof(local_existing), tmp, "/existing destination") == 0);
+    CHECK(append_path(interrupted, sizeof(interrupted), tmp, "/interrupted destination") == 0);
+    CHECK(append_path(symlink_path, sizeof(symlink_path), tmp, "/remote-link") == 0);
     CHECK(mkdir(srcdir, 0755) == 0 && mkdir(subdir, 0750) == 0 && mkdir(remote, 0755) == 0);
+    CHECK(symlink(remote, symlink_path) == 0);
+    CHECK(run_symlink_reject(symlink_path, local) == 0);
+    CHECK(run_symlink_reject("../remote", local) == 0);
     CHECK(append_path(p, sizeof(p), subdir, "/binary file.bin") == 0);
     CHECK(append_path(q, sizeof(q), srcdir, "/empty") == 0);
     static const unsigned char bytes[] = { 0, 1, 2, 0xff, 'L', 'N', 'D', 'B', '\n' };
     CHECK(write_file(p, bytes, sizeof(bytes), 0640) == 0);
     CHECK(write_file(q, bytes, 0, 0600) == 0);
+    CHECK(run_remote_failure(q, remote) == 0); /* positive FILE_DONE is failure */
     CHECK(run_transfer(1, srcdir, remote) == 0);
     CHECK(append_path(p, sizeof(p), remote, "/source tree/sub dir/binary file.bin") == 0);
     CHECK(append_path(q, sizeof(q), remote, "/source tree/empty") == 0);
@@ -192,6 +284,9 @@ int main(void)
 
     /* Pull into an existing destination directory keeps the source basename. */
     CHECK(mkdir(local_existing, 0755) == 0);
+    CHECK(mkdir(interrupted, 0755) == 0);
+    CHECK(append_path(interrupted_file, sizeof(interrupted_file), interrupted, "/source/file") == 0);
+    CHECK(run_interrupted_download(interrupted, interrupted_file) == 0);
     CHECK(append_path(remote_src, sizeof(remote_src), remote, "/source tree/") == 0);
     CHECK(run_transfer(0, remote_src, local_existing) == 0);
     CHECK(append_path(p, sizeof(p), local_existing, "/source tree/sub dir/binary file.bin") == 0);

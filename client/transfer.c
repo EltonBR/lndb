@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _FILE_OFFSET_BITS 64
 #include "lndb_protocol.h"
+#include "../common/file_wire.h"
 #include "transfer.h"
 #include <dirent.h>
 #include <errno.h>
@@ -37,12 +38,11 @@ static int safe_rel(const char *p)
 }
 static int send_meta(int fd, unsigned kind, uint32_t mode, uint64_t size, const char *rel)
 {
-    size_t n = strlen(rel); if (n > 65535 || n + 15 > LNDB_FRAME_MAX_PAYLOAD) return -1;
-    uint8_t *p = malloc(n + 15); if (!p) return -1;
-    p[0] = (uint8_t)kind; lndb_put_u32(p + 1, mode);
-    for (unsigned i=0;i<8;i++) p[5+i]=(uint8_t)(size >> (56-8*i));
-    p[13]=(uint8_t)(n>>8); p[14]=(uint8_t)n; memcpy(p+15,rel,n);
-    int r=lndb_send_frame(fd,LNDB_MSG_FILE_META,p,(uint32_t)(n+15)); free(p); return r;
+    uint8_t *p = NULL; uint32_t n = 0;
+    if (lndb_file_meta_encode((uint8_t)kind, mode, size, rel, &p, &n) < 0) return -1;
+    int r = lndb_send_frame(fd, LNDB_MSG_FILE_META, p, n);
+    free(p);
+    return r;
 }
 static int send_file(int fd, const char *local, const char *rel, const struct stat *st)
 {
@@ -59,7 +59,11 @@ static int send_tree(int fd,const char *local,const char *rel)
     if(S_ISLNK(st.st_mode)||(!S_ISDIR(st.st_mode)&&!S_ISREG(st.st_mode))){errno=EINVAL;return -1;}
     if(S_ISREG(st.st_mode))return send_file(fd,local,rel,&st);
     if(send_meta(fd,2,(uint32_t)(st.st_mode&0777),0,rel)<0)return -1;
-    DIR *d=opendir(local);if(!d)return -1; struct dirent *de; int rc=0;
+    int dfd = open(local, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dfd < 0) return -1;
+    DIR *d = fdopendir(dfd);
+    if (!d) { close(dfd); return -1; }
+    struct dirent *de; int rc=0;
     while((de=readdir(d))){if(!strcmp(de->d_name,".")||!strcmp(de->d_name,".."))continue;
         size_t a=strlen(rel),b=strlen(de->d_name); char *child=malloc(a+b+2),*path=malloc(strlen(local)+b+2);
         if(!child||!path){free(child);free(path);rc=-1;break;}
@@ -79,13 +83,12 @@ static char *join_path(const char *a,const char *b)
 static int receive_tree(int fd,const char *dest,const char *root,int strip_root)
 {
     for(;;){uint8_t type,*p=NULL;uint32_t n=0;if(lndb_recv_frame(fd,&type,&p,&n)<0)return -1;
-        if(type==LNDB_MSG_FILE_DONE){int status=(n==4)?(int)lndb_get_u32(p):1;free(p);return status? -1:0;}
-        if(type==LNDB_MSG_ERROR){if(n)(void)lndb_write_full(STDERR_FILENO,p,n);free(p);return -1;}
-        if(type!=LNDB_MSG_FILE_META||n<15){free(p);return -1;}
-        unsigned kind=p[0];uint32_t mode=lndb_get_u32(p+1);uint64_t size=0;for(unsigned i=0;i<8;i++)size=(size<<8)|p[5+i];
-        size_t plen=((size_t)p[13]<<8)|p[14]; if(plen+15!=n){free(p);return -1;}
-        char *rel=malloc(plen+1);if(!rel){free(p);return -1;}memcpy(rel,p+15,plen);rel[plen]=0;
-        if (memchr(rel, 0, plen)) { free(rel); free(p); return -1; }
+        if(type==LNDB_MSG_FILE_DONE){int ok=(n==4&&lndb_get_u32(p)==0);free(p);if(!ok)errno=EIO;return ok?0:-1;}
+        if(type==LNDB_MSG_ERROR){if(n)(void)lndb_write_full(STDERR_FILENO,p,n);free(p);errno=EIO;return -1;}
+        if(type!=LNDB_MSG_FILE_META){free(p);return -1;}
+        uint8_t kind; uint32_t mode; uint64_t size; const uint8_t *wire_path; size_t plen;
+        if(lndb_file_meta_decode(p,n,&kind,&mode,&size,&wire_path,&plen)<0){free(p);return -1;}
+        char *rel=malloc(plen+1);if(!rel){free(p);return -1;}memcpy(rel,wire_path,plen);rel[plen]=0;
         free(p);
         if(kind==0){free(rel);continue;}
         if(!safe_rel(rel)){free(rel);return -1;}
@@ -121,10 +124,14 @@ int lndb_client_transfer(int fd,int push,const char *src,const char *dst)
         int sent=send_tree(fd,source,rel);free(rel);free(source);if(sent<0)return -1;
         if(send_meta(fd,0,0,0,"")<0) return -1;
         uint8_t t,*p=NULL;uint32_t n=0;if(lndb_recv_frame(fd,&t,&p,&n)<0)return -1;
-        rc=(t==LNDB_MSG_FILE_DONE&&n==4)?(int)lndb_get_u32(p):-1;free(p);return rc;
+        rc=(t==LNDB_MSG_FILE_DONE&&n==4&&lndb_get_u32(p)==0)?0:-1;free(p);
+        if(rc<0)errno=EIO;
+        return rc;
     }
     struct stat st;int exists=lstat(dst,&st)==0;int is_dir=exists&&S_ISDIR(st.st_mode);
     char *dest=strdup(dst);if(!dest)return -1;
     if(mkdir_parents(dest)<0){free(dest);return -1;}
-    rc=receive_tree(fd,dest,base_name(src),!is_dir);free(dest);return rc;
+    char *root=base_name(src);
+    if(!root){free(dest);return -1;}
+    rc=receive_tree(fd,dest,root,!is_dir);free(root);free(dest);return rc;
 }

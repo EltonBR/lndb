@@ -31,8 +31,9 @@ version:
 client: version-bump $(CLIENT_BIN)
 daemon: version-bump $(DAEMON_BIN)
 
-test: $(BUILD_DIR)/tests/local_test
+test: $(BUILD_DIR)/tests/local_test $(BUILD_DIR)/tests/network_test $(DAEMON_BIN)
 	./$(BUILD_DIR)/tests/local_test
+	./$(BUILD_DIR)/tests/network_test $(DAEMON_BIN)
 
 install: all
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(SBINDIR)
@@ -48,6 +49,10 @@ $(DAEMON_BIN): $(VERSION_HEADER) $(COMMON_OBJ) $(DAEMON_OBJ)
 	$(CC) $(LDFLAGS) -o $@ $(filter %.o,$^) $(LDLIBS)
 
 $(BUILD_DIR)/tests/local_test: tests/local_test.c $(COMMON_OBJ) $(BUILD_DIR)/client/transfer.o $(BUILD_DIR)/daemon/transfer.o
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(BUILD_DIR)/tests/network_test: tests/network_test.c $(BUILD_DIR)/common/protocol.o
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 

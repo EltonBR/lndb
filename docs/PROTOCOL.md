@@ -62,7 +62,22 @@ followed by a NUL-free path string. `FILE_META` is kind (one byte: `0` end of
 tree, `1` regular file, `2` directory), mode (u32), size (u64), path length
 (u16), and that many relative path bytes. Files send `FILE_DATA` chunks then an
 empty `FILE_END`; directory trees end with kind `0`. `ERROR` contains a
-human-readable byte string.
+human-readable byte string. Kind `0` must have an empty path, while file and
+directory kinds must have a nonempty relative path; other kinds and embedded
+NUL bytes are malformed. For both `SHELL_EXIT` and `FILE_DONE`, status zero is
+success and every nonzero status is failure. The client maps a remote nonzero
+status to a failing CLI exit code.
+
+Daemon file request paths may be absolute or relative to the daemon's current
+directory. Parent (`..`) components are rejected. Existing symbolic links in
+any path component are rejected for both upload destinations and download
+sources; regular files and directories remain usable. This is path validation,
+not a filesystem sandbox: authenticated clients can still access paths
+permitted by the daemon's OS credentials. The implementation checks components
+with `lstat` and uses no-follow opens for final files and directories, but it
+does not hold a directory-descriptor walk for the full operation. A privileged
+local process that can rename path components concurrently may therefore still
+create a TOCTOU race.
 
 `PON_BLINK` has an 8-byte request payload: `interval_ms` (u32) followed by
 `times` (u32), both in network byte order. The interval must be 1..60000 ms,

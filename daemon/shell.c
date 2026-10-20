@@ -1,10 +1,12 @@
 #define _XOPEN_SOURCE 600
 #define _DEFAULT_SOURCE
+#include "shell.h"
 #include "lndb_protocol.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +26,30 @@ static int send_exit(int fd, int status)
     return lndb_send_frame(fd, LNDB_MSG_SHELL_EXIT, b, sizeof(b));
 }
 
+static int wait_child(pid_t pid, int *status)
+{
+    pid_t r;
+    do { r = waitpid(pid, status, 0); } while (r < 0 && errno == EINTR);
+    return r == pid ? 0 : -1;
+}
+
+static void stop_process_group(pid_t pid)
+{
+    if (pid <= 0) return;
+    (void)kill(-pid, SIGHUP);
+    /* Give the shell a chance to clean up, then ensure descendants are gone. */
+    usleep(100000);
+    (void)kill(-pid, SIGTERM);
+    usleep(100000);
+    (void)kill(-pid, SIGKILL);
+}
+
+static int set_nonblock(int fd)
+{
+    int flags = fcntl(fd, F_GETFL);
+    return flags < 0 ? -1 : fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 #define SCRIPT_LIMIT (16U * 1024U * 1024U)
 
 static int shell_pty(int fd, const char *script_path)
@@ -38,47 +64,62 @@ static int shell_pty(int fd, const char *script_path)
     if (!name) { close(master); return -1; }
     pid = fork();
     if (pid == 0) {
-        int slave;
+        int slave, saved_errno;
         close(master);
-        setsid();
+        if (setsid() < 0) _exit(127);
         slave = open(name, O_RDWR);
         if (slave < 0) _exit(127);
-        ioctl(slave, TIOCSCTTY, 0);
-        dup2(slave, 0); dup2(slave, 1); dup2(slave, 2);
+        if (ioctl(slave, TIOCSCTTY, 0) < 0 ||
+            dup2(slave, STDIN_FILENO) < 0 ||
+            dup2(slave, STDOUT_FILENO) < 0 ||
+            dup2(slave, STDERR_FILENO) < 0) {
+            saved_errno = errno;
+            close(slave);
+            errno = saved_errno;
+            _exit(127);
+        }
         if (slave > 2) close(slave);
         if (script_path) execl("/bin/sh", "sh", script_path, (char *)NULL);
         else execl("/bin/sh", "sh", (char *)NULL);
         _exit(127);
     }
     if (pid < 0) { close(master); return -1; }
+    int abort_child = 0;
     for (;;) {
         struct pollfd p[2] = {{fd, POLLIN, 0}, {master, POLLIN, 0}};
         int n = poll(p, 2, -1);
-        if (n < 0) { if (errno == EINTR) continue; break; }
+        if (n < 0) { if (errno == EINTR) continue; abort_child = 1; break; }
+        if (p[0].revents & POLLNVAL) { abort_child = 1; break; }
         if (p[0].revents & (POLLIN | POLLHUP | POLLERR)) {
             uint8_t t, *data = NULL; uint32_t len;
-            if (lndb_recv_frame(fd, &t, &data, &len) < 0) { free(data); break; }
+            if (lndb_recv_frame(fd, &t, &data, &len) < 0) { free(data); abort_child = 1; break; }
             if (t == LNDB_MSG_SHELL_STDIN) {
-                if (len && lndb_write_full(master, data, len) < 0) { free(data); break; }
+                if (len && lndb_write_full(master, data, len) < 0) { free(data); abort_child = 1; break; }
             } else if (t == LNDB_MSG_SHELL_RESIZE && len == 8) {
                 struct winsize ws;
                 ws.ws_row = (unsigned short)((data[0] << 8) | data[1]);
                 ws.ws_col = (unsigned short)((data[2] << 8) | data[3]);
                 ws.ws_xpixel = (unsigned short)((data[4] << 8) | data[5]);
                 ws.ws_ypixel = (unsigned short)((data[6] << 8) | data[7]);
-                ioctl(master, TIOCSWINSZ, &ws);
-            } else if (t == LNDB_MSG_CLOSE) { free(data); break; }
+                (void)ioctl(master, TIOCSWINSZ, &ws);
+            } else if (t == LNDB_MSG_CLOSE) { free(data); abort_child = 1; break; }
+            else { free(data); abort_child = 1; break; }
             free(data);
         }
         if (p[1].revents & (POLLIN | POLLHUP | POLLERR)) {
             uint8_t b[8192]; ssize_t got = read(master, b, sizeof(b));
-            if (got <= 0) break;
-            if (lndb_send_frame(fd, LNDB_MSG_SHELL_STDOUT, b, (uint32_t)got) < 0) break;
+            if (got <= 0) {
+                if (got < 0 && errno != EIO && errno != EINTR) abort_child = 1;
+                if (got < 0 && errno == EINTR) continue;
+                break;
+            }
+            if (lndb_send_frame(fd, LNDB_MSG_SHELL_STDOUT, b, (uint32_t)got) < 0) { abort_child = 1; break; }
         }
     }
     close(master);
-    kill(-pid, SIGHUP);
-    int status; while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (abort_child) stop_process_group(pid);
+    int status = -1;
+    if (wait_child(pid, &status) < 0) status = -1;
     return send_exit(fd, status);
 }
 
@@ -141,12 +182,23 @@ done:
 
 static int shell_exec(int fd, const uint8_t *command, uint32_t len)
 {
-    int out[2], err[2], in[2];
-    if (pipe(out) || pipe(err) || pipe(in)) return -1;
-    pid_t pid = fork();
+    int out[2] = {-1, -1}, err[2] = {-1, -1}, in[2] = {-1, -1};
+    int status = -1, abort_child = 0;
+    int input_open = 1, output_open = 1, error_open = 1;
+    pid_t pid;
+    uint8_t *pending = NULL;
+    uint32_t pending_len = 0, pending_offset = 0;
+    if (pipe(out) < 0) goto setup_error;
+    if (pipe(err) < 0) goto setup_error;
+    if (pipe(in) < 0) goto setup_error;
+    pid = fork();
     if (pid == 0) {
         close(out[0]); close(err[0]); close(in[1]);
-        dup2(in[0], 0); dup2(out[1], 1); dup2(err[1], 2);
+        if (setpgid(0, 0) < 0 ||
+            dup2(in[0], STDIN_FILENO) < 0 ||
+            dup2(out[1], STDOUT_FILENO) < 0 ||
+            dup2(err[1], STDERR_FILENO) < 0)
+            _exit(127);
         close(in[0]); close(out[1]); close(err[1]);
         char *cmd = malloc((size_t)len + 1);
         if (!cmd) _exit(127);
@@ -154,13 +206,22 @@ static int shell_exec(int fd, const uint8_t *command, uint32_t len)
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
-    if (pid < 0) return -1;
-    close(out[1]); close(err[1]); close(in[0]);
-    fcntl(out[0], F_SETFL, O_NONBLOCK); fcntl(err[0], F_SETFL, O_NONBLOCK);
-    fcntl(in[1], F_SETFL, O_NONBLOCK);
-    int input_open = 1, output_open = 1, error_open = 1, disconnected = 0;
-    uint8_t *pending = NULL;
-    uint32_t pending_len = 0, pending_offset = 0;
+    if (pid < 0) goto setup_error;
+    /* The child also calls setpgid, so either side can win the fork race. */
+    if (setpgid(pid, pid) < 0 && errno != EACCES && errno != ESRCH) {
+        abort_child = 1;
+        goto parent_cleanup;
+    }
+    if (out[1] >= 0) close(out[1]);
+    out[1] = -1;
+    if (err[1] >= 0) close(err[1]);
+    err[1] = -1;
+    if (in[0] >= 0) close(in[0]);
+    in[0] = -1;
+    if (set_nonblock(out[0]) < 0 || set_nonblock(err[0]) < 0 || set_nonblock(in[1]) < 0) {
+        abort_child = 1;
+        goto parent_cleanup;
+    }
     while (output_open || error_open || input_open) {
         struct pollfd p[4] = {
             {fd, (input_open && !pending) ? POLLIN : 0, 0},
@@ -168,10 +229,11 @@ static int shell_exec(int fd, const uint8_t *command, uint32_t len)
             {err[0], error_open ? POLLIN : 0, 0},
             {in[1], (input_open && pending) ? POLLOUT : 0, 0}
         };
-        if (poll(p, 4, -1) < 0) { if (errno == EINTR) continue; break; }
+        if (poll(p, 4, -1) < 0) { if (errno == EINTR) continue; abort_child = 1; break; }
+        if (p[0].revents & POLLNVAL) { abort_child = 1; break; }
         if (p[0].revents & (POLLIN | POLLHUP | POLLERR)) {
             uint8_t t, *data = NULL; uint32_t n;
-            if (lndb_recv_frame(fd, &t, &data, &n) < 0) { free(data); disconnected = 1; break; }
+            if (lndb_recv_frame(fd, &t, &data, &n) < 0) { free(data); abort_child = 1; break; }
             if (t == LNDB_MSG_SHELL_STDIN && n && input_open) {
                 pending = data;
                 pending_len = n;
@@ -180,6 +242,10 @@ static int shell_exec(int fd, const uint8_t *command, uint32_t len)
             } else if (t == LNDB_MSG_CLOSE && input_open) {
                 input_open = 0;
                 close(in[1]); in[1] = -1;
+            } else {
+                free(data);
+                abort_child = 1;
+                break;
             }
             free(data);
         }
@@ -200,18 +266,37 @@ static int shell_exec(int fd, const uint8_t *command, uint32_t len)
             int *active = j == 1 ? &output_open : &error_open;
             int stream = j == 1 ? LNDB_MSG_SHELL_STDOUT : LNDB_MSG_SHELL_STDERR;
             uint8_t b[8192]; ssize_t n = read(p[j].fd, b, sizeof(b));
-            if (n > 0) { if (lndb_send_frame(fd, (uint8_t)stream, b, (uint32_t)n) < 0) *active = 0; }
-            else { *active = 0; close(p[j].fd); }
+            if (n > 0) {
+                if (lndb_send_frame(fd, (uint8_t)stream, b, (uint32_t)n) < 0) {
+                    *active = 0;
+                    abort_child = 1;
+                }
+            } else if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            } else { *active = 0; close(p[j].fd); if (j == 1) out[0] = -1; else err[0] = -1; }
         }
-        if (!output_open && !error_open) break;
+        if (abort_child) break;
     }
+parent_cleanup:
+    if (out[0] >= 0) close(out[0]);
+    if (out[1] >= 0) close(out[1]);
+    if (err[0] >= 0) close(err[0]);
+    if (err[1] >= 0) close(err[1]);
+    if (in[0] >= 0) close(in[0]);
     if (in[1] >= 0) close(in[1]);
-    if (output_open) close(out[0]);
-    if (error_open) close(err[0]);
     free(pending);
-    if (disconnected) kill(pid, SIGTERM);
-    int status; while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (abort_child) stop_process_group(pid);
+    if (wait_child(pid, &status) < 0) status = -1;
     return send_exit(fd, status);
+
+setup_error:
+    if (out[0] >= 0) close(out[0]);
+    if (out[1] >= 0) close(out[1]);
+    if (err[0] >= 0) close(err[0]);
+    if (err[1] >= 0) close(err[1]);
+    if (in[0] >= 0) close(in[0]);
+    if (in[1] >= 0) close(in[1]);
+    return -1;
 }
 
 int lndbd_shell(int fd, const uint8_t *request, uint32_t len)

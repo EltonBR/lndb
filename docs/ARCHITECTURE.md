@@ -19,23 +19,31 @@ Linux, desde que forneçam as interfaces POSIX/Linux usadas pelo projeto.
 
 | Caminho | Responsabilidade |
 |---|---|
-| `client/main.c` | CLI, resolução `HOST[:PORT]` e IDs numéricos de discovery, conexão com timeout, tentativas de API keys, shell e comando `add device`. O último mapa de IDs é salvo ao lado da configuração do cliente. |
+| `client/main.c` | Entrada CLI, parsing de opções e despacho dos comandos. |
+| `client/connection.c` | Parsing de endpoints, conexão TCP com timeout e handshake/autenticação por API key. |
+| `client/config_store.c` | Caminho padrão, criação privada da configuração do cliente e atualização atômica da lista de chaves. |
+| `client/discovery.c` | Parsing de faixas IPv4, sondagem concorrente, identificação/autenticação de serviços e mapa local de IDs. |
+| `client/shell.c` | Terminal interativo, execução de comandos e envio de scripts por stdin. |
 | `client/transfer.c` | Envio/recepção de arquivos e árvores no cliente; valida caminhos relativos e trata arquivos locais sem seguir symlinks. |
 | `client/transfer.h` | Interface da transferência do cliente. |
-| `daemon/main.c` | Lê argumentos/configuração, escuta TCP, autentica e cria um processo filho por cliente; despacha shell e transferências e encaminha blink autenticado para o worker FIFO. |
+| `daemon/main.c` | Inicialização/configuração do servidor, listener, limite de filhos e encerramento. |
+| `daemon/session.c` | Greeting, timeout/autenticação e dispatch autenticado por conexão. |
+| `daemon/blink_queue.c` | Fila limitada, comunicação com worker e ciclo de vida do processo de blink. |
 | `daemon/gpio.c` | Controla exclusivamente GPIO15 via `/sys/class/gpio`; o worker executa um pedido por vez e restaura estado/direção anteriores. |
 
 O daemon mantém um worker de blink e uma fila limitada a 16 pedidos em
 execução/espera. O pedido do cliente termina quando o daemon confirma a entrada
 na fila. Ao receber SIGTERM/SIGINT, o worker conclui a sequência ativa para
 restaurar GPIO15 e descarta os pedidos ainda pendentes.
-| `daemon/shell.c` | Shell interativo com PTY e shell não interativo com pipes separados para stdin/stdout/stderr. |
+| `daemon/shell.c` | Shell interativo com PTY e shell não interativo com pipes separados para stdin/stdout/stderr; limpa grupos de processos em desconexões. |
 | `daemon/transfer.c` | Percorre árvores remotas, recebe envios, produz downloads, valida caminhos e rejeita symlinks/arquivos especiais. |
+| `common/file_wire.c` | Codificação/decodificação compartilhada dos metadados `FILE_META`. |
 | `common/protocol.c` | Leitura/escrita completa de streams, framing, limites de payload e conversão de inteiros para network byte order. |
 | `common/config.c` | Parser INI, validação dos campos e geração inicial da configuração do daemon com chave em `/dev/urandom`. |
 | `include/lndb_protocol.h` | Constantes, tipos de mensagem e API de framing; fonte de verdade para os números do protocolo. |
 | `include/lndb_config.h` | Estruturas de configuração e interfaces compartilhadas. |
-| `tests/local_test.c` | Testes em diretórios temporários para configuração, framing e push/pull recursivos. |
+| `tests/local_test.c` | Testes em diretórios temporários para configuração, framing, metadados e push/pull recursivos, incluindo falha remota e interrupção. |
+| `tests/network_test.c` | Integração TCP local com daemon real: autenticação, rejeição de chave, shell/exit code e timeout de autenticação. |
 | `docs/PROTOCOL.md` | Formato LNDB1 e payloads das mensagens. |
 | `docs/USAGE.md` | Guia de compilação, configuração, execução e comandos. |
 
@@ -49,7 +57,7 @@ restaurar GPIO15 e descarta os pedidos ainda pendentes.
 4. Só depois de `AUTH_OK` o cliente envia `SHELL_REQUEST` ou `FILE_REQUEST`.
 5. Cada conexão trata uma operação; não há multiplexação de operações.
 
-`connect_auth()` em `client/main.c` abre uma conexão por chave configurada e
+`lndb_client_connect_auth()` em `client/connection.c` abre uma conexão por chave configurada e
 experimenta as chaves na ordem do arquivo. `add device` usa o mesmo handshake
 com a chave fornecida na linha de comando; só depois da confirmação do daemon
 atualiza `api_key_list`. A substituição do arquivo do cliente é feita por
@@ -62,7 +70,10 @@ o filho autenticar e atender a operação, enquanto o processo pai volta ao
 `poll()` do socket de escuta. O pai verifica filhos encerrados com
 `waitpid(..., WNOHANG)` e, ao receber SIGINT/SIGTERM, fecha o listener, envia
 SIGTERM aos filhos registrados e aguarda sua saída. O número de clientes
-simultâneos rastreados pelo daemon é limitado a 128.
+simultâneos rastreados pelo daemon é limitado a 128; conexões excedentes são
+fechadas sem criar filhos não rastreados. O filho aplica um prazo absoluto de
+4 segundos ao greeting e à autenticação. Depois de autenticado, o prazo deixa
+de se aplicar para não limitar shells e transferências longas.
 
 Não há pool de threads, daemonização ou dependência de systemd. As operações
 ativas usam memória em blocos; a transferência não carrega um arquivo inteiro
@@ -113,9 +124,10 @@ componentes `.` ou `..`.
 
 ## Discovery
 
-`devices()` em `client/main.c` interpreta a faixa IPv4, abre sockets não
-bloqueantes em lotes limitados por `concurrency`, e espera cada lote por até
-`connect_timeout_ms`. Para identificar LNDB, a rotina espera um `HELLO` válido
+`lndb_client_devices()` em `client/discovery.c` interpreta a faixa IPv4, abre sockets não
+bloqueantes em lotes limitados por `concurrency`, e espera cada lote até
+`connect_timeout_ms`, mantendo sockets lentos pendentes até o prazo do lote.
+Para identificar LNDB, a rotina espera um `HELLO` válido
 e tenta as API keys configuradas. Mostra `device` para autenticação aceita e
 `unauthorized` para LNDB identificado sem chave válida; serviços que não
 respondem com o protocolo não aparecem. A porta de discovery é `[client]
