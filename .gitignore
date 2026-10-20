@@ -1,0 +1,24 @@
+# Build outputs
+/build/
+/build-*/
+*.o
+*.a
+
+# Local MIPS SDK (large generated/toolchain dependency)
+/mips32--musl--stable-2018.02-2/
+
+# Local configuration, device map, and generated package archive
+/lndb.conf
+/lndb.conf.devices
+/lndbd.conf
+/lndb.tar.gz
+/test.sh
+
+# Version bump and editor temporary files
+/VERSION.lock/
+/VERSION.tmp.*
+*.swp
+*~
+.DS_Store
+core
+core.*
