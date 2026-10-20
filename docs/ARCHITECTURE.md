@@ -10,8 +10,9 @@ terceiros.
 
 O código comum não depende de uma arquitetura específica. A primeira imagem
 alvo deste projeto é o Linux customizado 4.1.51 da FiberHome AN5506-01-A:
-BMIPS4350 MIPS32 big-endian, ABI o32, BusyBox e musl. O `build.sh` usa o SDK
-`mips32--musl--stable-2018.02-2` e gera executáveis estáticos por padrão. O
+BMIPS4350 MIPS32 big-endian, ABI o32, BusyBox e musl. O `build.sh` usa o SDK em
+`$HOME/.toolchains/mips32--musl--stable-2018.02-2` e gera executáveis estáticos
+por padrão. `TOOLCHAIN_DIR` pode selecionar outro SDK externo. O
 mesmo código pode ser compilado nativamente ou com toolchains para outros
 Linux, desde que forneçam as interfaces POSIX/Linux usadas pelo projeto.
 

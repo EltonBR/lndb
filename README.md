@@ -20,16 +20,18 @@ command guide, see [docs/USAGE.md](docs/USAGE.md). The wire format is in
 
 ## Build
 
-On Debian or Ubuntu, prepare the host and bundled MIPS SDK with:
+On Debian or Ubuntu, prepare the host and the MIPS SDK in
+`$HOME/.toolchains/mips32--musl--stable-2018.02-2` with:
 
 ```sh
 ./install-deps.sh
 ```
 
-This installs the host compiler/build tools and the runtime libraries required
-by the prebuilt SDK, then relocates that SDK to its current checkout path when
-needed. The ONU runtime is supplied by its existing musl-based firmware; this
-script does not install anything on the device.
+This installs host compiler/build tools and the runtime libraries required by
+the SDK, then relocates it to the toolchain directory when needed. Set
+`TOOLCHAIN_DIR` to use another external SDK location. The ONU runtime is
+supplied by its existing musl-based firmware; this script does not install
+anything on the device.
 
 ```sh
 make                 # build/lndb and build/lndbd
@@ -57,8 +59,8 @@ make install DESTDIR=/tmp/package-root
 The install target does not invoke `sudo`; use writable destinations or run it
 with the needed privileges.
 
-For the bundled MIPS32 big-endian toolchain, use the convenience script. It
-links the ONU binaries statically by default:
+For the MIPS32 big-endian toolchain outside the repository, use the convenience
+script. It links the ONU binaries statically by default:
 
 ```sh
 ./build.sh             # build-mips/lndb and build-mips/lndbd
@@ -80,7 +82,7 @@ Cross compile by selecting the compiler and a separate build directory, for
 example:
 
 ```sh
-make CC=./mips32--musl--stable-2018.02-2/bin/mips-buildroot-linux-musl-gcc BUILD_DIR=build-mips
+make CC="$HOME/.toolchains/mips32--musl--stable-2018.02-2/bin/mips-buildroot-linux-musl-gcc" BUILD_DIR=build-mips
 ```
 
 The cross-compiled daemon is placed at `build-mips/lndbd`, separate from the

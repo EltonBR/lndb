@@ -2,7 +2,8 @@
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-DEFAULT_CC=$SCRIPT_DIR/mips32--musl--stable-2018.02-2/bin/mips-buildroot-linux-musl-gcc
+TOOLCHAIN_DIR=${TOOLCHAIN_DIR:-${HOME:-}/.toolchains/mips32--musl--stable-2018.02-2}
+DEFAULT_CC=$TOOLCHAIN_DIR/bin/mips-buildroot-linux-musl-gcc
 CC=${CC:-$DEFAULT_CC}
 BUILD_DIR=${BUILD_DIR:-$SCRIPT_DIR/build-mips}
 JOBS=${JOBS:-2}

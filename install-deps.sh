@@ -1,12 +1,11 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-SDK_DIR=$SCRIPT_DIR/mips32--musl--stable-2018.02-2
+SDK_DIR=${TOOLCHAIN_DIR:-${HOME:-}/.toolchains/mips32--musl--stable-2018.02-2}
 SDK_CC=$SDK_DIR/bin/mips-buildroot-linux-musl-gcc
 
 if [ ! -x "$SDK_CC" ]; then
-    echo "install-deps: bundled MIPS toolchain is missing: $SDK_CC" >&2
+    echo "install-deps: MIPS toolchain is missing or not executable: $SDK_CC" >&2
     exit 1
 fi
 
@@ -38,7 +37,7 @@ fi
 
 SDK_OLD_LOCATION=$(cat "$SDK_LOCATION_FILE")
 if [ "$SDK_OLD_LOCATION" != "$SDK_DIR" ]; then
-    echo "Relocating the bundled MIPS SDK to $SDK_DIR..."
+    echo "Relocating the external MIPS SDK to $SDK_DIR..."
     (CDPATH= cd -- "$SDK_DIR" && ./relocate-sdk.sh)
 fi
 
@@ -49,5 +48,5 @@ case $SDK_TARGET in
 esac
 
 echo "Dependencies are ready. MIPS compiler target: $SDK_TARGET"
-echo "Build with: make CC=./mips32--musl--stable-2018.02-2/bin/mips-buildroot-linux-musl-gcc BUILD_DIR=build-mips"
+echo "Build with: TOOLCHAIN_DIR=$SDK_DIR ./build.sh daemon"
 echo "The target ONU must provide musl; this host script does not install software on the device."
