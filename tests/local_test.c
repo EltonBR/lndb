@@ -1,10 +1,13 @@
 #define _POSIX_C_SOURCE 200809L
 #define _FILE_OFFSET_BITS 64
 #include "lndb_config.h"
+#include "lndb_features.h"
 #include "lndb_protocol.h"
 #include "../client/transfer.h"
 #include "../common/file_wire.h"
+#if LNDB_ENABLE_PON_BLINK
 #include "../daemon/blink_queue.h"
+#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -52,6 +55,7 @@ static int test_invalid_frames(void)
     return 0;
 }
 
+#if LNDB_ENABLE_PON_BLINK
 static int test_blink_enqueue(void)
 {
     int requests[2], slots[2]; uint8_t token = 1, record[8];
@@ -84,6 +88,7 @@ static int test_blink_enqueue(void)
     close(requests[1]); close(slots[0]); close(slots[1]);
     return 0;
 }
+#endif
 
 static int server_transfer(int fd)
 {
@@ -248,7 +253,9 @@ int main(void)
     char tmp[] = "/tmp/lndb-local-test-XXXXXX";
     CHECK(mkdtemp(tmp) != NULL);
     CHECK(test_invalid_frames() == 0);
+#if LNDB_ENABLE_PON_BLINK
     CHECK(test_blink_enqueue() == 0);
+#endif
     char conf[512], badconf[512], clientconf[512], srcdir[512], subdir[512], remote[512], remote2[512], remote3[512];
     char local[512], local2[512], local3[512], local_existing[512], interrupted[512], interrupted_file[512], symlink_path[512], p[512], q[512], remote_src[512];
     CHECK(append_path(conf, sizeof(conf), tmp, "/nested/lndbd.conf") == 0);

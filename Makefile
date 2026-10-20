@@ -4,6 +4,7 @@ CFLAGS ?= -O2 -Wall -Wextra -std=c11
 LDFLAGS ?=
 LDLIBS ?=
 BUILD_DIR ?= build
+WITH_PON_BLINK ?= 1
 VERSION_FILE := VERSION
 PREFIX ?= $(HOME)/.local
 DESTDIR ?=
@@ -12,10 +13,22 @@ SBINDIR ?= $(PREFIX)/sbin
 
 VERSION_HEADER := $(BUILD_DIR)/generated/lndb_version.h
 override CPPFLAGS += -D_FILE_OFFSET_BITS=64 -D_POSIX_C_SOURCE=200809L -Iinclude -I$(BUILD_DIR)/generated
+override CPPFLAGS += -DLNDB_ENABLE_PON_BLINK=$(WITH_PON_BLINK)
+
+ifneq ($(WITH_PON_BLINK),0)
+ifneq ($(WITH_PON_BLINK),1)
+$(error WITH_PON_BLINK must be 0 or 1)
+endif
+endif
 
 COMMON_SRC := $(wildcard common/*.c)
 CLIENT_SRC := $(wildcard client/*.c)
-DAEMON_SRC := $(wildcard daemon/*.c)
+DAEMON_SRC := $(filter-out daemon/blink_queue.c daemon/gpio.c,$(wildcard daemon/*.c))
+BLINK_OBJ :=
+ifeq ($(WITH_PON_BLINK),1)
+DAEMON_SRC += daemon/blink_queue.c daemon/gpio.c
+BLINK_OBJ := $(BUILD_DIR)/daemon/blink_queue.o $(BUILD_DIR)/daemon/gpio.o
+endif
 COMMON_OBJ := $(patsubst %.c,$(BUILD_DIR)/%.o,$(COMMON_SRC))
 CLIENT_OBJ := $(patsubst %.c,$(BUILD_DIR)/%.o,$(CLIENT_SRC))
 DAEMON_OBJ := $(patsubst %.c,$(BUILD_DIR)/%.o,$(DAEMON_SRC))
@@ -52,7 +65,7 @@ $(DAEMON_BIN): $(VERSION_HEADER) $(COMMON_OBJ) $(DAEMON_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $(filter %.o,$^) $(LDLIBS)
 
-$(BUILD_DIR)/tests/local_test: tests/local_test.c $(COMMON_OBJ) $(BUILD_DIR)/client/transfer.o $(BUILD_DIR)/daemon/transfer.o $(BUILD_DIR)/daemon/blink_queue.o $(BUILD_DIR)/daemon/gpio.o
+$(BUILD_DIR)/tests/local_test: tests/local_test.c $(COMMON_OBJ) $(BUILD_DIR)/client/transfer.o $(BUILD_DIR)/daemon/transfer.o $(BLINK_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 

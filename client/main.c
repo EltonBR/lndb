@@ -3,6 +3,7 @@
 #include "lndb_config.h"
 #include "lndb_protocol.h"
 #include "lndb_version.h"
+#include "lndb_features.h"
 #include "transfer.h"
 #include "shell.h"
 #include "connection.h"
@@ -30,20 +31,25 @@ static void print_usage(FILE *stream)
             "  lndb [--config FILE] TARGET shell [COMMAND...]\n"
             "  lndb [--config FILE] TARGET push SOURCE DESTINATION\n"
             "  lndb [--config FILE] TARGET pull SOURCE DESTINATION\n"
+#if LNDB_ENABLE_PON_BLINK
             "  lndb [--config FILE] TARGET blink INTERVAL_MS TIMES\n"
             "      submits the blink request to the daemon queue and exits\n"
+#endif
             "\n"
             "TARGET is an IP address (optionally with :PORT) or a numeric ID\n"
             "from the latest 'lndb devices' scan.\n"
             "\n"
             "Examples:\n"
             "  lndb 192.168.10.29 shell uname -a\n"
+#if LNDB_ENABLE_PON_BLINK
             "  lndb 1 blink 100 10\n"
+#endif
             "  lndb 1 shell\n"
             "  lndb 1 push ./file /tmp/\n"
             "  lndb 1 pull /tmp/logfile.log .\n");
 }
 
+#if LNDB_ENABLE_PON_BLINK
 static int parse_blink_arg(const char *text, uint32_t min, uint32_t max,
                            uint32_t *value)
 {
@@ -80,6 +86,7 @@ static int pon_blink(int fd, uint32_t interval_ms, uint32_t times)
         return -1;
     }
 }
+#endif
 
 int main(int argc, char **argv)
 {
@@ -152,6 +159,7 @@ int main(int argc, char **argv)
     else if (arg + 1 < argc) {
         const char *endpoint = argv[arg++], *op = argv[arg++];
         char *host = NULL; uint16_t port; int tcp_connected = 0, identified = 0;
+#if LNDB_ENABLE_PON_BLINK
         uint32_t blink_interval = 0, blink_times = 0;
         if (!strcmp(op, "blink") &&
             (argc - arg != 2 ||
@@ -168,6 +176,7 @@ int main(int argc, char **argv)
             rc = 2;
             goto operation_done;
         }
+#endif
         int id_result = lndb_client_resolve_device_id(endpoint, config_path, &host, &port);
         if (id_result < 0) {
             fprintf(stderr, "lndb: unknown or invalid device ID '%s'; run 'lndb devices' to refresh IDs\n", endpoint);
@@ -175,7 +184,11 @@ int main(int argc, char **argv)
         } else if (id_result == 0 && lndb_client_parse_endpoint(endpoint, cfg.port, &host, &port) < 0) {
             fprintf(stderr, "lndb: invalid endpoint: %s\n", endpoint); rc = 2;
         } else if (cfg.api_key_count == 0 &&
-                   (!strcmp(op, "shell") || !strcmp(op, "push") || !strcmp(op, "pull") || !strcmp(op, "blink"))) {
+                   (!strcmp(op, "shell") || !strcmp(op, "push") || !strcmp(op, "pull")
+#if LNDB_ENABLE_PON_BLINK
+                    || !strcmp(op, "blink")
+#endif
+                   )) {
             fprintf(stderr,
                     "lndb: no API keys configured in %s; register the daemon key with "
                     "'lndb add device %s <API_KEY>'\n",
@@ -193,10 +206,12 @@ int main(int argc, char **argv)
             }
             else {
                 if (!strcmp(op, "shell")) rc = lndb_client_shell_run(fd, argc - arg, argv + arg);
+#if LNDB_ENABLE_PON_BLINK
                 else if (!strcmp(op, "blink")) {
                     if (pon_blink(fd, blink_interval, blink_times) < 0) { perror("lndb: PON LED blink"); rc = 1; }
                     else { printf("PON LED blink request queued (%u cycles, %u ms per phase)\n", blink_times, blink_interval); rc = 0; }
                 }
+#endif
                 else if (!strcmp(op, "push") || !strcmp(op, "pull")) {
                     if (argc - arg != 2) { fprintf(stderr, "usage: lndb HOST[:PORT] %s SRC DST\n", op); rc = 2; }
                     else if (lndb_client_transfer(fd, !strcmp(op, "push"), argv[arg], argv[arg + 1]) < 0) {
@@ -208,7 +223,9 @@ int main(int argc, char **argv)
                 close(fd);
             }
         }
+#if LNDB_ENABLE_PON_BLINK
 operation_done:
+#endif
         free(host);
     } else { fprintf(stderr, "lndb: missing host and operation\n"); rc = 2; }
 out:

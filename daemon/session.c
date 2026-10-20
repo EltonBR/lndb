@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "session.h"
+#include "lndb_features.h"
 
 #include "lndb_protocol.h"
 #include "shell.h"
@@ -92,8 +93,12 @@ static int authenticate(int fd, const char *key)
     return lndb_send_frame(fd, LNDB_MSG_AUTH_OK, NULL, 0);
 }
 
+#if LNDB_ENABLE_PON_BLINK
 void lndbd_session_serve(int fd, const char *api_key,
                          const struct lndbd_blink_queue *blink_queue)
+#else
+void lndbd_session_serve(int fd, const char *api_key)
+#endif
 {
     uint8_t type, *payload = NULL;
     uint32_t len;
@@ -108,7 +113,9 @@ void lndbd_session_serve(int fd, const char *api_key,
         lndbd_shell(fd, payload, len);
     } else if (type == LNDB_MSG_FILE_REQUEST) {
         lndbd_transfer(fd, payload, len);
-    } else if (type == LNDB_MSG_PON_BLINK) {
+    }
+#if LNDB_ENABLE_PON_BLINK
+    else if (type == LNDB_MSG_PON_BLINK) {
         if (len != 8) {
             send_error(fd, "invalid PON LED blink request");
         } else {
@@ -125,7 +132,9 @@ void lndbd_session_serve(int fd, const char *api_key,
                 lndb_send_frame(fd, LNDB_MSG_PON_BLINK_QUEUED, NULL, 0);
             }
         }
-    } else {
+    }
+#endif
+    else {
         send_error(fd, "unsupported operation");
     }
     free(payload);

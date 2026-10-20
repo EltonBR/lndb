@@ -316,7 +316,10 @@ build/lndb 192.168.10.29 shell < script.sh
 
 ## 8. Piscar o LED PON
 
-Na FiberHome AN5506-01-A com o kernel custom Linux 4.1.51:
+Este comando é uma extensão específica da FiberHome AN5506-01-A com firmware
+custom Linux 4.1.51. Ele controla o LED PON ativo em nível baixo no GPIO15;
+não é uma operação genérica de Linux nem deve ser usada em outros modelos ou
+no firmware OEM. O suporte vem habilitado por padrão.
 
 ```sh
 build/lndb 192.168.10.29 blink 100 10
@@ -338,6 +341,25 @@ usa GPIO15 em `/sys/class/gpio`, restaura o nível e a direção anteriores e
 desexporta o pino somente se ele próprio o exportou. Essa operação exige que
 `lndbd` tenha permissão de root no dispositivo e que o driver GPIO esperado
 esteja disponível. Outros dispositivos Linux podem responder com erro.
+
+Para compilar cliente e daemon sem essa operação, use `WITH_PON_BLINK=0`. Isso
+define `LNDB_ENABLE_PON_BLINK=0`; escolha outro diretório de build para não
+reutilizar objetos compilados com a opção anterior:
+
+```sh
+make BUILD_DIR=build-no-blink WITH_PON_BLINK=0
+```
+
+Para compilar o daemon MIPS sem a fila nem a implementação específica de GPIO:
+
+```sh
+WITH_PON_BLINK=0 BUILD_DIR=build-mips-no-blink ./build.sh daemon
+```
+
+Nesse build, `blink` não aparece na ajuda do cliente e o daemon responde
+`unsupported operation` se receber essa requisição. Os identificadores de
+mensagem permanecem reservados no protocolo LNDB1 para manter seus valores
+estáveis.
 
 ## 9. Enviar e receber arquivos
 

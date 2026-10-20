@@ -79,7 +79,12 @@ does not hold a directory-descriptor walk for the full operation. A privileged
 local process that can rename path components concurrently may therefore still
 create a TOCTOU race.
 
-`PON_BLINK` has an 8-byte request payload: `interval_ms` (u32) followed by
+`PON_BLINK` is an optional, platform-specific extension. It is enabled by
+default for the FiberHome AN5506-01-A custom Linux 4.1.51 build and can be
+compiled out with `WITH_PON_BLINK=0`. Message identifiers stay reserved when
+disabled; a daemon without the feature responds `ERROR` with
+`unsupported operation`. When enabled, `PON_BLINK` has an 8-byte request
+payload: `interval_ms` (u32) followed by
 `times` (u32), both in network byte order. The interval must be 1..60000 ms,
 the count 1..1000, and `2 * interval_ms * times` must not exceed 120000 ms.
 Each ON and OFF phase lasts `interval_ms`; `times` counts complete on/off

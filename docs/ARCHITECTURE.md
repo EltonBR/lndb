@@ -28,13 +28,17 @@ Linux, desde que forneçam as interfaces POSIX/Linux usadas pelo projeto.
 | `client/transfer.h` | Interface da transferência do cliente. |
 | `daemon/main.c` | Inicialização/configuração do servidor, listener, limite de filhos e encerramento. |
 | `daemon/session.c` | Greeting, timeout/autenticação e dispatch autenticado por conexão. |
-| `daemon/blink_queue.c` | Fila limitada, comunicação com worker e ciclo de vida do processo de blink. |
-| `daemon/gpio.c` | Controla exclusivamente GPIO15 via `/sys/class/gpio`; o worker executa um pedido por vez e restaura estado/direção anteriores. |
+| `daemon/blink_queue.c` | (Opcional) Fila limitada e processo worker para o blink específico da ONU. |
+| `daemon/gpio.c` | (Opcional) Controla GPIO15 via `/sys/class/gpio` na imagem custom da AN5506-01-A e restaura estado/direção anteriores. |
 
-O daemon mantém um worker de blink e uma fila limitada a 16 pedidos em
-execução/espera. O pedido do cliente termina quando o daemon confirma a entrada
-na fila. Ao receber SIGTERM/SIGINT, o worker conclui a sequência ativa para
-restaurar GPIO15 e descarta os pedidos ainda pendentes.
+`blink` é uma extensão específica da AN5506-01-A custom Linux 4.1.51, não parte
+das operações portáveis do LNDB. Por padrão, o daemon mantém um worker e uma
+fila limitada a 16 pedidos em execução/espera. `WITH_PON_BLINK=0` define
+`LNDB_ENABLE_PON_BLINK=0` e exclui a fila, a implementação GPIO e o comando da
+CLI. Mensagens `PON_BLINK` recebidas nessa configuração são tratadas como
+operação não suportada; os identificadores do protocolo continuam reservados.
+Ao receber SIGTERM/SIGINT com o recurso habilitado, o worker conclui a sequência
+ativa para restaurar GPIO15 e descarta os pedidos ainda pendentes.
 | `daemon/shell.c` | Shell interativo com PTY e shell não interativo com pipes separados para stdin/stdout/stderr; limpa grupos de processos em desconexões. |
 | `daemon/transfer.c` | Percorre árvores remotas, recebe envios, produz downloads, valida caminhos e rejeita symlinks/arquivos especiais. |
 | `common/file_wire.c` | Codificação/decodificação compartilhada dos metadados `FILE_META`. |

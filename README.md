@@ -151,8 +151,9 @@ lndb 192.168.10.10 push ./arquivo /tmp/
 lndb 192.168.10.10 push ./projeto /opt/
 ```
 
-`blink INTERVAL_MS TIMES` submits a request to toggle the AN5506-01-A PON LED using GPIO15
-(active low). For example, `blink 100 10` performs 10 complete on/off cycles,
+`blink INTERVAL_MS TIMES` is a platform extension for the AN5506-01-A custom
+Linux 4.1.51 image. It toggles the PON LED using active-low GPIO15. For example,
+`blink 100 10` performs 10 complete on/off cycles,
 with each phase lasting 100 ms, then restores its previous GPIO direction and
 level. The client exits after the daemon confirms the request was queued; it
 does not wait for the sequence to finish. Requests are processed in FIFO order.
@@ -161,6 +162,19 @@ queue is reported immediately; GPIO errors discovered after acceptance go to
 the daemon log. On shutdown, the active sequence completes and restores GPIO
 state while queued requests are discarded. Interval is limited to 1..60000 ms,
 count to 1..1000, and total time to 120 seconds.
+
+PON blink support is enabled by default. Build without the platform-specific
+CLI command, daemon queue, and GPIO implementation using `WITH_PON_BLINK=0`;
+use a separate build directory when changing this option:
+
+```sh
+make BUILD_DIR=build-no-blink WITH_PON_BLINK=0
+```
+
+For a MIPS daemon without blink support, run
+`WITH_PON_BLINK=0 BUILD_DIR=build-mips-no-blink ./build.sh daemon`. LNDB1
+message type numbers remain reserved, and a daemon built without this feature
+returns `unsupported operation` for blink requests.
 
 `add device` validates the supplied 64-character hexadecimal API key against
 the specified LNDB daemon. Only after successful authentication does it append
