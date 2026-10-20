@@ -65,6 +65,13 @@ links the ONU binaries statically by default:
 ./build.sh client      # client only
 ```
 
+To deploy the daemon to one custom AN5506-01-A by IPv4 address, run
+`./install-onu.sh 192.168.10.29`. It builds the MIPS daemon if needed, uploads
+it over FTP, updates the startup hook over Telnet, and restarts LNDB without
+rebooting or writing firmware/MTD. The installer refuses targets that do not
+match the custom BCM68385/MIPS/Linux 4.1.51 runtime. It requires host Python 3
+and the FTP/Telnet access configured by that image.
+
 Set `JOBS`, `BUILD_DIR`, or `CC` to override its defaults. Other make variables
 such as `CFLAGS`, `CPPFLAGS`, `LDFLAGS`, and `LDLIBS` are passed through.
 

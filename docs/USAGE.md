@@ -124,6 +124,30 @@ log é perdido no reboot. A inicialização não é feita pelo LNDB e o exemplo 
 se aplica ao firmware OEM. Não grave MTD, não altere bootloader e não reinicie
 a ONU como parte da instalação do LNDB.
 
+Para instalar ou atualizar automaticamente uma ONU por IP, use o instalador do
+repositório:
+
+```sh
+./install-onu.sh 192.168.10.29
+```
+
+O script compila `lndbd` para MIPS quando o binário `build-mips/lndbd` está
+ausente ou desatualizado. Em seguida, valida por Telnet que o alvo é o firmware
+custom BCM68385/MIPS/Linux 4.1.51 e que `/opt` e `/start-on-boot.sh` são
+graváveis. Transfere o binário por FTP, instala em `/opt/lndb/lndbd`, inicia ou
+reinicia o daemon e garante uma única entrada de inicialização no
+`/start-on-boot.sh`. A configuração existente e a API key são preservadas; se
+a configuração ainda não existir, o primeiro início do daemon a cria. Na
+primeira atualização, o binário anterior é preservado em
+`/opt/lndb/lndbd.previous`; se o script precisar acrescentar a entrada de boot,
+salva o script anterior em `/start-on-boot.sh.pre-lndb`.
+
+O instalador requer Python 3 no computador e acesso FTP/Telnet root conforme a
+imagem custom atual (senha root vazia). Ele aceita um endereço IPv4 por
+execução, não reinicia a ONU e não grava MTD, bootloader ou firmware. A
+verificação recusa kernels, arquiteturas e modelos incompatíveis; não use no
+firmware OEM Linux 3.4.11-rt19. Restrinja FTP e Telnet à rede de administração.
+
 ## 4. Configurar o cliente
 
 Na primeira execução, o cliente cria
