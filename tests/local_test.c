@@ -4,6 +4,7 @@
 #include "lndb_protocol.h"
 #include "../client/transfer.h"
 #include "../common/file_wire.h"
+#include "../daemon/blink_queue.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -18,6 +19,71 @@
 extern int lndbd_transfer(int, const uint8_t *, uint32_t);
 
 #define CHECK(x) do { if (!(x)) { perror(#x); return 1; } } while (0)
+
+static int test_invalid_frames(void)
+{
+    int sv[2]; uint8_t type, *payload = NULL; uint32_t len;
+    uint8_t header[LNDB_FRAME_HEADER_SIZE] = { 'L', 'N', 'D', 'B', LNDB_PROTOCOL_VERSION, LNDB_MSG_AUTH };
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    CHECK(write(sv[0], header, 4) == 4);
+    CHECK(shutdown(sv[0], SHUT_WR) == 0);
+    CHECK(lndb_recv_frame(sv[1], &type, &payload, &len) < 0 && payload == NULL);
+    close(sv[0]); close(sv[1]);
+
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    lndb_put_u32(header + 6, 3);
+    CHECK(write(sv[0], header, sizeof(header)) == (ssize_t)sizeof(header));
+    CHECK(write(sv[0], "x", 1) == 1);
+    CHECK(shutdown(sv[0], SHUT_WR) == 0);
+    CHECK(lndb_recv_frame(sv[1], &type, &payload, &len) < 0 && payload == NULL);
+    close(sv[0]); close(sv[1]);
+
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    lndb_put_u32(header + 6, LNDB_FRAME_MAX_PAYLOAD + 1u);
+    CHECK(write(sv[0], header, sizeof(header)) == (ssize_t)sizeof(header));
+    CHECK(lndb_recv_frame(sv[1], &type, &payload, &len) < 0 && payload == NULL);
+    close(sv[0]); close(sv[1]);
+
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    header[5] = 255; lndb_put_u32(header + 6, 0);
+    CHECK(write(sv[0], header, sizeof(header)) == (ssize_t)sizeof(header));
+    CHECK(lndb_recv_frame(sv[1], &type, &payload, &len) < 0 && payload == NULL);
+    close(sv[0]); close(sv[1]);
+    return 0;
+}
+
+static int test_blink_enqueue(void)
+{
+    int requests[2], slots[2]; uint8_t token = 1, record[8];
+    struct lndbd_blink_queue queue = { 0, -1, -1, -1 };
+    int flags;
+    CHECK(pipe(requests) == 0 && pipe(slots) == 0);
+    CHECK(write(slots[1], &token, 1) == 1);
+    flags = fcntl(slots[0], F_GETFL, 0); CHECK(flags >= 0);
+    CHECK(fcntl(slots[0], F_SETFL, flags | O_NONBLOCK) == 0);
+    flags = fcntl(requests[1], F_GETFL, 0); CHECK(flags >= 0);
+    CHECK(fcntl(requests[1], F_SETFL, flags | O_NONBLOCK) == 0);
+    queue.request_fd = requests[1]; queue.slots_fd = slots[0]; queue.slots_return_fd = slots[1];
+    CHECK(lndbd_blink_queue_enqueue(&queue, 100, 3) == 0);
+    CHECK(read(requests[0], record, sizeof(record)) == (ssize_t)sizeof(record));
+    CHECK(lndb_get_u32(record) == 100 && lndb_get_u32(record + 4) == 3);
+    errno = 0;
+    CHECK(lndbd_blink_queue_enqueue(&queue, 100, 3) < 0 &&
+          (errno == EAGAIN || errno == EWOULDBLOCK));
+    close(requests[0]); close(requests[1]); close(slots[0]); close(slots[1]);
+
+    CHECK(pipe(requests) == 0 && pipe(slots) == 0);
+    CHECK(write(slots[1], &token, 1) == 1);
+    close(requests[0]);
+    queue.request_fd = requests[1]; queue.slots_fd = slots[0]; queue.slots_return_fd = slots[1];
+    void (*old_handler)(int) = signal(SIGPIPE, SIG_IGN);
+    errno = 0;
+    CHECK(lndbd_blink_queue_enqueue(&queue, 100, 3) < 0 && errno == EPIPE);
+    CHECK(read(slots[0], &token, 1) == 1 && token == 1);
+    (void)signal(SIGPIPE, old_handler);
+    close(requests[1]); close(slots[0]); close(slots[1]);
+    return 0;
+}
 
 static int server_transfer(int fd)
 {
@@ -104,6 +170,30 @@ static int run_interrupted_download(const char *dest, const char *expected)
     return 0;
 }
 
+static void server_interrupt_upload(int fd)
+{
+    uint8_t type, *payload = NULL; uint32_t len = 0;
+    if (lndb_recv_frame(fd, &type, &payload, &len) < 0 || type != LNDB_MSG_FILE_REQUEST) _exit(2);
+    free(payload); payload = NULL;
+    if (lndb_recv_frame(fd, &type, &payload, &len) < 0 || type != LNDB_MSG_FILE_META) _exit(3);
+    free(payload);
+    close(fd);
+    _exit(0);
+}
+
+static int run_interrupted_upload(const char *src, const char *dest)
+{
+    int sv[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    pid_t pid = fork(); CHECK(pid >= 0);
+    if (pid == 0) { close(sv[0]); server_interrupt_upload(sv[1]); }
+    close(sv[1]);
+    int rc = lndb_client_transfer(sv[0], 1, src, dest);
+    close(sv[0]); int status;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(rc < 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    return 0;
+}
+
 static int run_symlink_reject(const char *linkpath, const char *dest)
 {
     int sv[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -157,6 +247,8 @@ int main(void)
 {
     char tmp[] = "/tmp/lndb-local-test-XXXXXX";
     CHECK(mkdtemp(tmp) != NULL);
+    CHECK(test_invalid_frames() == 0);
+    CHECK(test_blink_enqueue() == 0);
     char conf[512], badconf[512], clientconf[512], srcdir[512], subdir[512], remote[512], remote2[512], remote3[512];
     char local[512], local2[512], local3[512], local_existing[512], interrupted[512], interrupted_file[512], symlink_path[512], p[512], q[512], remote_src[512];
     CHECK(append_path(conf, sizeof(conf), tmp, "/nested/lndbd.conf") == 0);
@@ -241,6 +333,7 @@ int main(void)
     CHECK(write_file(p, bytes, sizeof(bytes), 0640) == 0);
     CHECK(write_file(q, bytes, 0, 0600) == 0);
     CHECK(run_remote_failure(q, remote) == 0); /* positive FILE_DONE is failure */
+    CHECK(run_interrupted_upload(p, remote) == 0);
     CHECK(run_transfer(1, srcdir, remote) == 0);
     CHECK(append_path(p, sizeof(p), remote, "/source tree/sub dir/binary file.bin") == 0);
     CHECK(append_path(q, sizeof(q), remote, "/source tree/empty") == 0);

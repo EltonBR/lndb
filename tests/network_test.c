@@ -226,6 +226,36 @@ fail:
     return -1;
 }
 
+static int run_real_client_shell(const char *client, const char *config,
+                                 uint16_t port, const char *command,
+                                 int expected_status)
+{
+    char endpoint[32];
+    snprintf(endpoint, sizeof(endpoint), "127.0.0.1:%u", (unsigned)port);
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int nullfd = open("/dev/null", O_RDWR);
+        if (nullfd >= 0) {
+            (void)dup2(nullfd, STDIN_FILENO);
+            (void)dup2(nullfd, STDOUT_FILENO);
+            if (nullfd > STDERR_FILENO) close(nullfd);
+        }
+        execl(client, client, "--config", config, endpoint, "shell", command, (char *)NULL);
+        _exit(127);
+    }
+    int status;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        return -1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != expected_status) {
+        errno = EPROTO;
+        return -1;
+    }
+    return 0;
+}
+
 static void stop_daemon(pid_t pid)
 {
     int status;
@@ -245,6 +275,7 @@ int main(int argc, char **argv)
 {
     char temp[] = "/tmp/lndb-network-test-XXXXXX";
     char config[512] = "";
+    char client_config[512] = "";
     char config_text[512];
     uint16_t port = 0;
     pid_t daemon_pid = -1;
@@ -254,10 +285,13 @@ int main(int argc, char **argv)
 
     (void)signal(SIGALRM, on_test_timeout);
     alarm(TEST_TIMEOUT_SECONDS);
-    if (argc != 2) { fprintf(stderr, "usage: %s PATH_TO_LNDBD\n", argv[0]); return 2; }
+    if (argc != 3) { fprintf(stderr, "usage: %s PATH_TO_LNDBD PATH_TO_LNDB\n", argv[0]); return 2; }
     if (!mkdtemp(temp)) { perror("mkdtemp"); goto cleanup; }
     if (snprintf(config, sizeof(config), "%s/lndbd.conf", temp) >= (int)sizeof(config)) {
         fprintf(stderr, "temporary config path too long\n"); goto cleanup;
+    }
+    if (snprintf(client_config, sizeof(client_config), "%s/lndb.conf", temp) >= (int)sizeof(client_config)) {
+        fprintf(stderr, "temporary client config path too long\n"); goto cleanup;
     }
     if (reserve_port(&port) < 0) { perror("reserve port"); goto cleanup; }
     int n = snprintf(config_text, sizeof(config_text),
@@ -267,6 +301,16 @@ int main(int argc, char **argv)
     config_fd = open(config, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (config_fd < 0 || write_all(config_fd, config_text, (size_t)n) < 0 || close(config_fd) < 0) {
         config_fd = -1; perror("write config"); goto cleanup;
+    }
+    config_fd = -1;
+    n = snprintf(config_text, sizeof(config_text),
+                 "[client]\nport = %u\nconnect_timeout_ms = 500\n\n"
+                 "[discovery]\nnetwork = 127.0.0.1-127.0.0.1\nconcurrency = 1\n\n"
+                 "[auth]\napi_key_list = %s\n", (unsigned)port, TEST_KEY);
+    if (n < 0 || (size_t)n >= sizeof(config_text)) { fprintf(stderr, "client config too large\n"); goto cleanup; }
+    config_fd = open(client_config, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (config_fd < 0 || write_all(config_fd, config_text, (size_t)n) < 0 || close(config_fd) < 0) {
+        config_fd = -1; perror("write client config"); goto cleanup;
     }
     config_fd = -1;
     daemon_pid = fork();
@@ -306,6 +350,10 @@ int main(int argc, char **argv)
 
     if (test_shell(port) < 0) { perror("remote shell command"); goto cleanup; }
     if (test_auth_timeout(port) < 0) { perror("auth timeout"); goto cleanup; }
+    if (run_real_client_shell(argv[2], client_config, port, "exit 0", 0) < 0 ||
+        run_real_client_shell(argv[2], client_config, port, "exit 7", 7) < 0) {
+        perror("real lndb shell exit status"); goto cleanup;
+    }
     puts("local TCP daemon auth, shell, and auth-timeout checks passed");
     rc = 0;
 cleanup:
@@ -314,6 +362,7 @@ cleanup:
     stop_daemon(daemon_pid);
     daemon_child = -1;
     if (config[0]) unlink(config);
+    if (client_config[0]) unlink(client_config);
     if (temp[0]) rmdir(temp);
     alarm(0);
     return rc;

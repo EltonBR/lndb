@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netdb.h>
 #include <poll.h>
 #include <stdint.h>
@@ -15,6 +16,122 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+
+struct deadline { struct timespec at; };
+
+static int deadline_start(struct deadline *d, unsigned timeout_ms)
+{
+    if (clock_gettime(CLOCK_MONOTONIC, &d->at) < 0) return -1;
+    d->at.tv_sec += timeout_ms / 1000;
+    d->at.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (d->at.tv_nsec >= 1000000000L) { d->at.tv_sec++; d->at.tv_nsec -= 1000000000L; }
+    return 0;
+}
+
+static int deadline_remaining(const struct deadline *d)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) return 0;
+    time_t sec = d->at.tv_sec - now.tv_sec;
+    long nsec = d->at.tv_nsec - now.tv_nsec;
+    if (nsec < 0) { sec--; nsec += 1000000000L; }
+    if (sec < 0 || (sec == 0 && nsec <= 0)) return 0;
+    if (sec > INT_MAX / 1000) return INT_MAX;
+    long long ms = (long long)sec * 1000 + (nsec + 999999L) / 1000000L;
+    return ms > INT_MAX ? INT_MAX : (int)ms;
+}
+
+static int wait_socket(int fd, short events, const struct deadline *d)
+{
+    struct pollfd p = { fd, events, 0 };
+    for (;;) {
+        int left = deadline_remaining(d), rc;
+        if (!left) { errno = ETIMEDOUT; return -1; }
+        rc = poll(&p, 1, left);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc == 0) { errno = ETIMEDOUT; return -1; }
+        if (rc < 0) return -1;
+        if (p.revents & POLLNVAL) { errno = EBADF; return -1; }
+        if (p.revents & POLLERR) {
+            int err = 0; socklen_t n = sizeof(err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &n) == 0 && err) errno = err;
+            else errno = ECONNRESET;
+            return -1;
+        }
+        if (p.revents & events) return 0;
+        if (p.revents & POLLHUP) { errno = ECONNRESET; return -1; }
+    }
+}
+
+static int timed_read_full(int fd, void *buffer, size_t length,
+                           const struct deadline *d)
+{
+    uint8_t *p = buffer;
+    while (length) {
+        if (wait_socket(fd, POLLIN, d) < 0) return -1;
+        ssize_t n = recv(fd, p, length, 0);
+        if (n > 0) { p += (size_t)n; length -= (size_t)n; }
+        else if (n == 0) { errno = ECONNRESET; return -1; }
+        else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+    }
+    return 0;
+}
+
+static int timed_write_full(int fd, const void *buffer, size_t length,
+                            const struct deadline *d)
+{
+    const uint8_t *p = buffer;
+    while (length) {
+        if (wait_socket(fd, POLLOUT, d) < 0) return -1;
+        ssize_t n;
+#ifdef MSG_NOSIGNAL
+        n = send(fd, p, length, MSG_NOSIGNAL);
+#else
+        n = send(fd, p, length, 0);
+#endif
+        if (n > 0) { p += (size_t)n; length -= (size_t)n; }
+        else if (n == 0) { errno = EPIPE; return -1; }
+        else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+    }
+    return 0;
+}
+
+static int recv_control_frame(int fd, uint8_t *type, uint32_t *length,
+                              const struct deadline *d)
+{
+    uint8_t header[LNDB_FRAME_HEADER_SIZE];
+    if (timed_read_full(fd, header, sizeof(header), d) < 0) return -1;
+    if (memcmp(header, "LNDB", 4) || header[4] != LNDB_PROTOCOL_VERSION) {
+        errno = EPROTO; return -1;
+    }
+    *type = header[5];
+    *length = lndb_get_u32(header + 6);
+    if (*length > LNDB_FRAME_MAX_PAYLOAD) { errno = EMSGSIZE; return -1; }
+    return 0;
+}
+
+static int send_control_frame(int fd, uint8_t type, const void *payload,
+                              uint32_t length, const struct deadline *d)
+{
+    uint8_t header[LNDB_FRAME_HEADER_SIZE];
+    memcpy(header, "LNDB", 4);
+    header[4] = LNDB_PROTOCOL_VERSION;
+    header[5] = type;
+    lndb_put_u32(header + 6, length);
+    if (timed_write_full(fd, header, sizeof(header), d) < 0) return -1;
+    return length ? timed_write_full(fd, payload, length, d) : 0;
+}
+
+int lndb_client_wait_hello(int fd, unsigned timeout_ms)
+{
+    struct deadline d;
+    uint8_t type;
+    uint32_t length;
+    if (deadline_start(&d, timeout_ms) < 0 ||
+        recv_control_frame(fd, &type, &length, &d) < 0) return -1;
+    if (type != LNDB_MSG_HELLO || length != 0) { errno = EPROTO; return -1; }
+    return 0;
+}
 
 int lndb_client_connect_host(const char *host, uint16_t port,
                              unsigned timeout_ms)
@@ -28,6 +145,8 @@ int lndb_client_connect_host(const char *host, uint16_t port,
     if (getaddrinfo(host, service, &hints, &res) != 0) return -1;
 
     int fd = -1;
+    struct deadline deadline;
+    if (deadline_start(&deadline, timeout_ms) < 0) { freeaddrinfo(res); return -1; }
     for (ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
@@ -45,7 +164,13 @@ int lndb_client_connect_host(const char *host, uint16_t port,
         }
         if (rc < 0) {
             struct pollfd p = { fd, POLLOUT, 0 };
-            do rc = poll(&p, 1, (int)timeout_ms); while (rc < 0 && errno == EINTR);
+            for (;;) {
+                int left = deadline_remaining(&deadline);
+                if (!left) { rc = 0; errno = ETIMEDOUT; break; }
+                rc = poll(&p, 1, left);
+                if (rc < 0 && errno == EINTR) continue;
+                break;
+            }
             int err = 0;
             socklen_t elen = sizeof(err);
             if (rc <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0 || err) {
@@ -123,46 +248,42 @@ int lndb_client_valid_api_key(const char *key)
 
 int lndb_client_connect_auth(const char *host,
                              const struct lndb_client_config *cfg,
-                             int io_timeout, int *tcp_connected,
-                             int *identified)
+                             int *tcp_connected, int *identified)
 {
     if (!host || !cfg || !tcp_connected || !identified) return -1;
+    struct deadline deadline;
     *tcp_connected = 0;
     *identified = 0;
+    if (deadline_start(&deadline, cfg->connect_timeout_ms) < 0) return -1;
     for (size_t k = 0; k < cfg->api_key_count; ++k) {
-        int fd = lndb_client_connect_host(host, cfg->port,
-                                          cfg->connect_timeout_ms);
+        int left = deadline_remaining(&deadline);
+        if (!left) { errno = ETIMEDOUT; return -1; }
+        int fd = lndb_client_connect_host(host, cfg->port, (unsigned)left);
         if (fd < 0) return -1;
         *tcp_connected = 1;
-        if (io_timeout) {
-            struct timeval tv;
-            tv.tv_sec = (time_t)(cfg->connect_timeout_ms / 1000);
-            tv.tv_usec = (suseconds_t)((cfg->connect_timeout_ms % 1000) * 1000);
-            (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        }
-        uint8_t type, *payload = NULL;
-        uint32_t len = 0;
-        if (lndb_recv_frame(fd, &type, &payload, &len) < 0 ||
-            type != LNDB_MSG_HELLO || len != 0) {
-            free(payload);
+        uint8_t type;
+        uint32_t len;
+        if (recv_control_frame(fd, &type, &len, &deadline) < 0) {
             close(fd);
             return -1;
         }
-        free(payload);
+        if (type != LNDB_MSG_HELLO || len != 0) {
+            errno = EPROTO;
+            close(fd);
+            return -1;
+        }
         *identified = 1;
         size_t keylen = strlen(cfg->api_keys[k]);
         if (keylen > LNDB_FRAME_MAX_PAYLOAD ||
-            lndb_send_frame(fd, LNDB_MSG_AUTH, cfg->api_keys[k],
-                            (uint32_t)keylen) < 0) {
+            send_control_frame(fd, LNDB_MSG_AUTH, cfg->api_keys[k],
+                               (uint32_t)keylen, &deadline) < 0) {
             close(fd);
             return -1;
         }
-        if (lndb_recv_frame(fd, &type, &payload, &len) < 0) {
+        if (recv_control_frame(fd, &type, &len, &deadline) < 0) {
             close(fd);
             continue;
         }
-        free(payload);
         if (type == LNDB_MSG_AUTH_OK && len == 0) return fd;
         close(fd);
     }

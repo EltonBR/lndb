@@ -74,7 +74,7 @@ api_key_list = chave_hexadecimal_1,chave_hexadecimal_2
 | Campo | Obrigatório | Default se omitido | Valores aceitos |
 |---|---:|---|---|
 | `[client] port` | não | `5555` | Inteiro decimal de `1` a `65535`; porta padrão para discovery e endpoints sem `:PORT`. |
-| `[client] connect_timeout_ms` | não | `500` | Inteiro decimal de `1` a `600000`; conexão e janela de espera de cada lote de discovery. |
+| `[client] connect_timeout_ms` | não | `500` | Inteiro decimal de `1` a `600000`; prazo de conexão e handshake LNDB para cada endpoint, além da janela TCP de cada lote do discovery. Após autenticação, shell e transferências não herdam esse prazo. |
 | `[discovery] network` | não | `192.168.10.*` | Faixa IPv4 não vazia, validada quando `devices` é executado. Aceita `192.168.10.*`, `192.168.10.x`, CIDR ou intervalo inclusivo `IP-INICIAL-IP-FINAL`. |
 | `[discovery] concurrency` | não | `32` | Inteiro decimal de `1` a `4096`; máximo de conexões de discovery simultâneas. |
 | `[auth] api_key_list` | sim | — | Lista vazia ou chaves de 64 caracteres hexadecimais, separadas por vírgulas. |

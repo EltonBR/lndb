@@ -201,7 +201,7 @@ Campos da configuração:
 | Campo | Uso | Valor padrão |
 |---|---|---|
 | `[client] port` | Porta padrão para discovery e operações sem `:PORT`. | `5555` |
-| `connect_timeout_ms` | Timeout de conexão e janela por lote de discovery, em ms. | `500` |
+| `connect_timeout_ms` | Prazo de conexão e handshake LNDB por endpoint, e janela TCP por lote de discovery, em ms. Após autenticar, shell e transferências não herdam esse prazo. | `500` |
 | `[discovery] network` | Faixa IPv4 varrida por `devices`. | `192.168.10.*` |
 | `concurrency` | Máximo de conexões não bloqueantes simultâneas na varredura. | `32` |
 | `[auth] api_key_list` | API keys hexadecimais separadas por vírgulas. Pode estar vazia antes do primeiro cadastro. | vazio |

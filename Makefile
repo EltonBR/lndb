@@ -22,7 +22,7 @@ DAEMON_OBJ := $(patsubst %.c,$(BUILD_DIR)/%.o,$(DAEMON_SRC))
 CLIENT_BIN := $(BUILD_DIR)/lndb
 DAEMON_BIN := $(BUILD_DIR)/lndbd
 
-.PHONY: all client daemon test install clean version version-bump FORCE_VERSION_HEADER
+.PHONY: all client daemon test test-sanitize install clean version version-bump FORCE_VERSION_HEADER
 all: version-bump client daemon
 
 version:
@@ -31,9 +31,13 @@ version:
 client: version-bump $(CLIENT_BIN)
 daemon: version-bump $(DAEMON_BIN)
 
-test: $(BUILD_DIR)/tests/local_test $(BUILD_DIR)/tests/network_test $(DAEMON_BIN)
+test: $(BUILD_DIR)/tests/local_test $(BUILD_DIR)/tests/network_test $(BUILD_DIR)/tests/client_test $(CLIENT_BIN) $(DAEMON_BIN)
 	./$(BUILD_DIR)/tests/local_test
-	./$(BUILD_DIR)/tests/network_test $(DAEMON_BIN)
+	./$(BUILD_DIR)/tests/client_test
+	./$(BUILD_DIR)/tests/network_test $(DAEMON_BIN) $(CLIENT_BIN)
+
+test-sanitize:
+	$(MAKE) BUILD_DIR=build-sanitize CFLAGS='-O1 -g -Wall -Wextra -Werror -std=c11 -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined' test
 
 install: all
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(SBINDIR)
@@ -48,13 +52,17 @@ $(DAEMON_BIN): $(VERSION_HEADER) $(COMMON_OBJ) $(DAEMON_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $(filter %.o,$^) $(LDLIBS)
 
-$(BUILD_DIR)/tests/local_test: tests/local_test.c $(COMMON_OBJ) $(BUILD_DIR)/client/transfer.o $(BUILD_DIR)/daemon/transfer.o
+$(BUILD_DIR)/tests/local_test: tests/local_test.c $(COMMON_OBJ) $(BUILD_DIR)/client/transfer.o $(BUILD_DIR)/daemon/transfer.o $(BUILD_DIR)/daemon/blink_queue.o $(BUILD_DIR)/daemon/gpio.o
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(BUILD_DIR)/tests/network_test: tests/network_test.c $(BUILD_DIR)/common/protocol.o
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(BUILD_DIR)/tests/client_test: tests/client_test.c $(BUILD_DIR)/client/connection.o $(BUILD_DIR)/client/discovery.o $(BUILD_DIR)/client/shell.o $(BUILD_DIR)/common/protocol.o
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -Iclient $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(BUILD_DIR)/client/main.o $(BUILD_DIR)/daemon/main.o: $(VERSION_HEADER)
 

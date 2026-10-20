@@ -13,6 +13,9 @@ int lndb_client_parse_endpoint(const char *endpoint, uint16_t default_port,
 int lndb_client_connect_host(const char *host, uint16_t port,
                              unsigned timeout_ms);
 
+/* Verify an LNDB1 HELLO on an already connected socket within timeout_ms. */
+int lndb_client_wait_hello(int fd, unsigned timeout_ms);
+
 /*
  * Try configured API keys in order. Success returns an authenticated socket
  * which remains open. On failure returns -1; tcp_connected and identified
@@ -20,8 +23,7 @@ int lndb_client_connect_host(const char *host, uint16_t port,
  */
 int lndb_client_connect_auth(const char *host,
                              const struct lndb_client_config *cfg,
-                             int io_timeout, int *tcp_connected,
-                             int *identified);
+                             int *tcp_connected, int *identified);
 
 int lndb_client_valid_api_key(const char *key);
 

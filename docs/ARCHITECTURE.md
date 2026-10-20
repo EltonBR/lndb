@@ -43,7 +43,8 @@ restaurar GPIO15 e descarta os pedidos ainda pendentes.
 | `include/lndb_protocol.h` | Constantes, tipos de mensagem e API de framing; fonte de verdade para os números do protocolo. |
 | `include/lndb_config.h` | Estruturas de configuração e interfaces compartilhadas. |
 | `tests/local_test.c` | Testes em diretórios temporários para configuração, framing, metadados e push/pull recursivos, incluindo falha remota e interrupção. |
-| `tests/network_test.c` | Integração TCP local com daemon real: autenticação, rejeição de chave, shell/exit code e timeout de autenticação. |
+| `tests/client_test.c` | Peers TCP locais para timeout de handshake, desconexão durante autenticação e discovery com peers silenciosos e lentos. |
+| `tests/network_test.c` | Integração TCP local com daemon e cliente reais: autenticação, rejeição de chave, shell/exit code e timeout de autenticação. |
 | `docs/PROTOCOL.md` | Formato LNDB1 e payloads das mensagens. |
 | `docs/USAGE.md` | Guia de compilação, configuração, execução e comandos. |
 
@@ -60,7 +61,9 @@ restaurar GPIO15 e descarta os pedidos ainda pendentes.
 `lndb_client_connect_auth()` em `client/connection.c` abre uma conexão por chave configurada e
 experimenta as chaves na ordem do arquivo. `add device` usa o mesmo handshake
 com a chave fornecida na linha de comando; só depois da confirmação do daemon
-atualiza `api_key_list`. A substituição do arquivo do cliente é feita por
+atualiza `api_key_list`. O prazo monotônico de `connect_timeout_ms` cobre
+conexão TCP, `HELLO` e resposta da autenticação; após autenticar, operações
+longas continuam sem timeout imposto pelo handshake. A substituição do arquivo do cliente é feita por
 arquivo temporário e `rename()`, com modo `0600`.
 
 ## Processos e concorrência
@@ -127,6 +130,8 @@ componentes `.` ou `..`.
 `lndb_client_devices()` em `client/discovery.c` interpreta a faixa IPv4, abre sockets não
 bloqueantes em lotes limitados por `concurrency`, e espera cada lote até
 `connect_timeout_ms`, mantendo sockets lentos pendentes até o prazo do lote.
+As sondagens de protocolo também têm prazo, incluindo o frame `HELLO`; um peer
+silencioso ou que envia um frame incompleto é descartado e a varredura continua.
 Para identificar LNDB, a rotina espera um `HELLO` válido
 e tenta as API keys configuradas. Mostra `device` para autenticação aceita e
 `unauthorized` para LNDB identificado sem chave válida; serviços que não
@@ -177,4 +182,6 @@ de inicialização nesse firmware. Não aplique esse caminho ao firmware OEM.
 O Makefile suporta `CC`, `CPPFLAGS`, `CFLAGS`, `LDFLAGS`, `LDLIBS` e
 `BUILD_DIR`. Use um diretório diferente por toolchain para não misturar objetos
 de host e alvo. `make test` executa testes locais em diretórios temporários;
-não valida a rede real, a PTY na ONU nem a instalação no hardware.
+os testes incluem o daemon e cliente reais em loopback, além de peers TCP
+simulados. `make test-sanitize` executa ASan e UBSan nativos. Nenhum dos alvos
+valida a rede real, a PTY na ONU nem a instalação no hardware.

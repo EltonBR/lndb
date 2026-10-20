@@ -9,6 +9,7 @@ struct lndbd_blink_queue {
     pid_t worker_pid;
     int request_fd;
     int slots_fd;
+    int slots_return_fd;
 };
 
 int lndbd_blink_queue_start(struct lndbd_blink_queue *queue, int server_fd);

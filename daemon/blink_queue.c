@@ -94,6 +94,7 @@ int lndbd_blink_queue_start(struct lndbd_blink_queue *queue, int server_fd)
     queue->worker_pid = 0;
     queue->request_fd = -1;
     queue->slots_fd = -1;
+    queue->slots_return_fd = -1;
     if (pipe(request_pipe) < 0 || pipe(slot_pipe) < 0) goto fail;
     if (set_fd_flag(request_pipe[0], F_GETFD, FD_CLOEXEC) < 0 ||
         set_fd_flag(request_pipe[1], F_GETFD, FD_CLOEXEC) < 0 ||
@@ -115,10 +116,10 @@ int lndbd_blink_queue_start(struct lndbd_blink_queue *queue, int server_fd)
         blink_worker(request_pipe[0], slot_pipe[1]);
     }
     close(request_pipe[0]);
-    close(slot_pipe[1]);
     queue->worker_pid = pid;
     queue->request_fd = request_pipe[1];
     queue->slots_fd = slot_pipe[0];
+    queue->slots_return_fd = slot_pipe[1];
     return 0;
 
 fail:
@@ -145,7 +146,7 @@ int lndbd_blink_queue_enqueue(const struct lndbd_blink_queue *queue,
     while (n < 0 && errno == EINTR);
     if (n != (ssize_t)sizeof(request)) {
         int saved_errno = errno;
-        while (write(queue->slots_fd, &slot, sizeof(slot)) < 0 && errno == EINTR) {}
+        while (write(queue->slots_return_fd, &slot, sizeof(slot)) < 0 && errno == EINTR) {}
         errno = saved_errno;
         return -1;
     }
@@ -174,4 +175,6 @@ void lndbd_blink_queue_stop(struct lndbd_blink_queue *queue)
     queue->worker_pid = 0;
     if (queue->slots_fd >= 0) close(queue->slots_fd);
     queue->slots_fd = -1;
+    if (queue->slots_return_fd >= 0) close(queue->slots_return_fd);
+    queue->slots_return_fd = -1;
 }

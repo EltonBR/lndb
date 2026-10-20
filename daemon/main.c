@@ -69,7 +69,7 @@ int main(int argc, char **argv)
     struct lndb_server_config cfg;
     char err[256];
     int i, server;
-    struct lndbd_blink_queue blink_queue = {0, -1, -1};
+    struct lndbd_blink_queue blink_queue = {0, -1, -1, -1};
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--config") && i + 1 < argc) config_path = argv[++i];
         else if (!strcmp(argv[i], "--version")) {
@@ -101,6 +101,9 @@ int main(int argc, char **argv)
     }
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    /* Pipe writes from blink admission must report EPIPE instead of killing
+     * the server if its worker exits between requests. */
+    signal(SIGPIPE, SIG_IGN);
     while (!stopping) {
         reap_clients();
         lndbd_blink_queue_reap(&blink_queue);

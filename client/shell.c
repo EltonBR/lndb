@@ -85,32 +85,35 @@ int lndb_client_shell_run(int fd, int argc, char **argv)
             struct sigaction sa, oldsa;
             memset(&sa, 0, sizeof(sa)); sa.sa_handler = on_winch; sigemptyset(&sa.sa_mask);
             int have_oldsa = sigaction(SIGWINCH, &sa, &oldsa) == 0;
-            (void)send_resize(fd, tty_fd);
             int done = 0, status = 0;
-            while (!done) {
+            if (send_resize(fd, tty_fd) < 0) status = 1;
+            while (!done && !status) {
                 if (got_winch) { got_winch = 0; if (send_resize(fd, tty_fd) < 0) { status = 1; break; } }
                 struct pollfd pfd[2] = {{ fd, POLLIN, 0 }, { tty_fd, POLLIN, 0 }};
                 int r = poll(pfd, 2, -1);
                 if (r < 0) { if (errno == EINTR) continue; status = 1; break; }
-                if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+                if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
                     uint8_t type, *p = NULL; uint32_t n = 0;
                     if (lndb_recv_frame(fd, &type, &p, &n) < 0) { status = 1; break; }
                     if (type == LNDB_MSG_SHELL_STDOUT || type == LNDB_MSG_SHELL_STDERR) {
                         if (n && lndb_write_full(tty_fd, p, n) < 0) status = 1;
                     } else if (type == LNDB_MSG_SHELL_EXIT) {
                         if (n == 4) status = (int)lndb_get_u32(p);
+                        else status = 1;
                         done = 1;
                     } else if (type == LNDB_MSG_ERROR) {
                         if (n) (void)lndb_write_full(tty_fd, p, n);
                         status = 1; done = 1;
-                    }
+                    } else { status = 1; done = 1; }
                     free(p);
                     if (status == 1 && !done) break;
                 }
-                if (!done && (pfd[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+                if (!done && (pfd[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
                     ssize_t n = read(tty_fd, b, sizeof(b));
                     if (n <= 0) {
-                        (void)lndb_send_frame(fd, LNDB_MSG_CLOSE, NULL, 0);
+                        if (n < 0 && errno == EINTR) continue;
+                        if (n < 0) status = 1;
+                        if (lndb_send_frame(fd, LNDB_MSG_CLOSE, NULL, 0) < 0) status = 1;
                         done = 1;
                     } else if (lndb_send_frame(fd, LNDB_MSG_SHELL_STDIN, b, (uint32_t)n) < 0) {
                         status = 1; done = 1;
@@ -135,13 +138,14 @@ script_interactive_done:
             int ready = poll(pfd, 2, -1);
             if (ready < 0) { if (errno == EINTR) continue; return -1; }
 
-            if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+            if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
                 uint8_t type, *p = NULL; uint32_t n = 0;
                 if (lndb_recv_frame(fd, &type, &p, &n) < 0) return status;
                 if (type == LNDB_MSG_SHELL_STDOUT || type == LNDB_MSG_SHELL_STDERR) {
                     int out = type == LNDB_MSG_SHELL_STDERR ? STDERR_FILENO : STDOUT_FILENO;
                     if (n && lndb_write_full(out, p, n) < 0) { free(p); return -1; }
-                } else if (type == LNDB_MSG_SHELL_EXIT && n == 4) {
+                } else if (type == LNDB_MSG_SHELL_EXIT) {
+                    if (n != 4) { free(p); errno = EPROTO; return 1; }
                     uint32_t v = lndb_get_u32(p);
                     status = v > 255 ? 255 : (int)v;
                     free(p);
@@ -150,11 +154,15 @@ script_interactive_done:
                     if (n) (void)lndb_write_full(STDERR_FILENO, p, n);
                     free(p);
                     return 1;
+                } else {
+                    free(p);
+                    errno = EPROTO;
+                    return 1;
                 }
                 free(p);
             }
 
-            if (input_open && (pfd[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            if (input_open && (pfd[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
                 uint8_t b[4096];
                 ssize_t n = read(STDIN_FILENO, b, sizeof(b));
                 if (n > 0) {
@@ -162,39 +170,46 @@ script_interactive_done:
                 } else if (n == 0) {
                     if (lndb_send_frame(fd, LNDB_MSG_CLOSE, NULL, 0) < 0) return -1;
                     input_open = 0;
-                } else if (errno != EINTR) {
-                    if (lndb_send_frame(fd, LNDB_MSG_CLOSE, NULL, 0) < 0) return -1;
-                    input_open = 0;
-                }
+                } else if (errno != EINTR) return -1;
             }
         }
     }
     tty_fd = STDIN_FILENO;
     struct termios old; int raw = set_raw(tty_fd, &old) == 0;
     struct sigaction sa, oldsa; memset(&sa, 0, sizeof(sa)); sa.sa_handler = on_winch; sigemptyset(&sa.sa_mask);
-    sigaction(SIGWINCH, &sa, &oldsa); (void)send_resize(fd, tty_fd);
-    int done = 0, status = 0;
+    int have_oldsa = sigaction(SIGWINCH, &sa, &oldsa) == 0;
+    int status = 0;
+    if (send_resize(fd, tty_fd) < 0) status = 1;
+    int done = 0;
     while (!done) {
-        if (got_winch) { got_winch = 0; if (send_resize(fd, tty_fd) < 0) break; }
+        if (status) break;
+        if (got_winch) { got_winch = 0; if (send_resize(fd, tty_fd) < 0) { status = 1; break; } }
         struct pollfd pfd[2] = {{ fd, POLLIN, 0 }, { STDIN_FILENO, POLLIN, 0 }};
-        int r = poll(pfd, 2, -1); if (r < 0) { if (errno == EINTR) continue; break; }
-        if (pfd[0].revents & (POLLIN | POLLHUP)) {
+        int r = poll(pfd, 2, -1); if (r < 0) { if (errno == EINTR) continue; status = 1; break; }
+        if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
             uint8_t type, *p; uint32_t n;
-            if (lndb_recv_frame(fd, &type, &p, &n) < 0) break;
+            if (lndb_recv_frame(fd, &type, &p, &n) < 0) { status = 1; break; }
             if (type == LNDB_MSG_SHELL_STDOUT || type == LNDB_MSG_SHELL_STDERR) {
                 int out = type == LNDB_MSG_SHELL_STDERR ? STDERR_FILENO : STDOUT_FILENO;
-                if (n && lndb_write_full(out, p, n) < 0) { free(p); break; }
-            } else if (type == LNDB_MSG_SHELL_EXIT) { if (n == 4) status = (int)lndb_get_u32(p); done = 1; }
+                if (n && lndb_write_full(out, p, n) < 0) { free(p); status = 1; break; }
+            } else if (type == LNDB_MSG_SHELL_EXIT) {
+                if (n != 4) status = 1;
+                else status = (int)lndb_get_u32(p);
+                done = 1;
+            }
             else if (type == LNDB_MSG_ERROR) { if (n) (void)lndb_write_full(STDERR_FILENO, p, n); done = 1; status = 1; }
+            else { free(p); status = 1; break; }
             free(p);
         }
-        if (!done && (pfd[1].revents & (POLLIN | POLLHUP))) {
+        if (!done && (pfd[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
             uint8_t b[4096]; ssize_t n = read(STDIN_FILENO, b, sizeof(b));
-            if (n <= 0) { (void)lndb_send_frame(fd, LNDB_MSG_CLOSE, NULL, 0); done = 1; }
-            else if (lndb_send_frame(fd, LNDB_MSG_SHELL_STDIN, b, (uint32_t)n) < 0) break;
+            if (n == 0) { if (lndb_send_frame(fd, LNDB_MSG_CLOSE, NULL, 0) < 0) status = 1; done = 1; }
+            else if (n < 0) { if (errno != EINTR) { status = 1; break; } }
+            else if (lndb_send_frame(fd, LNDB_MSG_SHELL_STDIN, b, (uint32_t)n) < 0) { status = 1; break; }
         }
     }
-    sigaction(SIGWINCH, &oldsa, NULL); if (raw) tcsetattr(STDIN_FILENO, TCSAFLUSH, &old);
+    if (have_oldsa) sigaction(SIGWINCH, &oldsa, NULL);
+    if (raw) tcsetattr(STDIN_FILENO, TCSAFLUSH, &old);
     return status;
 }
 

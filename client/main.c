@@ -126,7 +126,7 @@ int main(int argc, char **argv)
         struct lndb_client_config one = cfg;
         one.port = port; one.api_keys = single_key; one.api_key_count = 1;
         int tcp_connected = 0, identified = 0;
-        int fd = lndb_client_connect_auth(host, &one, 1, &tcp_connected, &identified);
+        int fd = lndb_client_connect_auth(host, &one, &tcp_connected, &identified);
         free(host);
         if (fd < 0) {
             fprintf(stderr, "lndb: %s: %s\n", endpoint,
@@ -183,7 +183,7 @@ int main(int argc, char **argv)
             rc = 1;
         } else {
             cfg.port = port;
-            int fd = lndb_client_connect_auth(host, &cfg, 0, &tcp_connected, &identified);
+            int fd = lndb_client_connect_auth(host, &cfg, &tcp_connected, &identified);
             if (fd < 0) {
                 const char *reason = identified ? "API key rejected (unauthorized)" :
                     tcp_connected ? "TCP connected, but the peer did not send a valid LNDB1 greeting" :

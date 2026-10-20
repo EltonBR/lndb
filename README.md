@@ -36,7 +36,8 @@ make                 # build/lndb and build/lndbd
 make client          # build/lndb
 make daemon          # build/lndbd
 make version         # print current version counter without incrementing
-make test             # temporary-directory config/framing/transfer checks
+make test             # local protocol, client, transfer and daemon regressions
+make test-sanitize    # native ASan + UBSan regression run
 make clean
 ```
 

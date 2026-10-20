@@ -59,18 +59,29 @@ int lndb_client_ip_range(const char *spec, uint32_t *first_ip, uint32_t *last_ip
     return 0;
 }
 
+static int remaining_ms(const struct timespec *deadline);
+
 static int probe(const char *host, const struct lndb_client_config *cfg)
 {
     if (cfg->api_key_count == 0) {
-        int fd = lndb_client_connect_host(host, cfg->port, cfg->connect_timeout_ms);
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_MONOTONIC, &deadline) < 0) return -1;
+        deadline.tv_sec += (time_t)(cfg->connect_timeout_ms / 1000);
+        deadline.tv_nsec += (long)(cfg->connect_timeout_ms % 1000) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        int left = remaining_ms(&deadline);
+        if (!left) return -1;
+        int fd = lndb_client_connect_host(host, cfg->port, (unsigned)left);
         if (fd < 0) return -1;
-        uint8_t type, *payload = NULL; uint32_t len = 0;
-        int ok = lndb_recv_frame(fd, &type, &payload, &len) == 0 &&
-                 type == LNDB_MSG_HELLO && len == 0;
-        free(payload); close(fd); return ok ? 0 : -1;
+        left = remaining_ms(&deadline);
+        int ok = left > 0 && lndb_client_wait_hello(fd, (unsigned)left) == 0;
+        close(fd); return ok ? 0 : -1;
     }
     int tcp_connected = 0, identified = 0;
-    int fd = lndb_client_connect_auth(host, cfg, 1, &tcp_connected, &identified);
+    int fd = lndb_client_connect_auth(host, cfg, &tcp_connected, &identified);
     if (fd >= 0) { close(fd); return 1; }
     return identified ? 0 : -1;
 }
